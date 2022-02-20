@@ -30,11 +30,13 @@ async fn main() -> Result<()> {
     let run_watcher = tokio::spawn(async move {
         let tx = tx.clone();
         watcher
+            // can probably turn this into a filter_map and then a for each that
+            // sends data through channel?
             .try_for_each(|pod| {
                 let sender = tx.clone();
                 async move {
                     // TODO: Remove unwrap
-                    handle_pod(sender, pod).await.unwrap();
+                    handle_pod(sender, pod).await;
                     Ok(())
                 }
             })
@@ -45,7 +47,7 @@ async fn main() -> Result<()> {
     let run_sweeper = tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             async move {
-                let SweepJob { id, ip } = job;
+                let (id, ip) = job;
                 let req = {
                     let uri = hyper::Uri::builder()
                         .scheme(http::uri::Scheme::HTTP)
@@ -72,12 +74,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-struct SweepJob {
-    id: String,
-    ip: String,
-}
-
-async fn handle_pod(tx: mpsc::Sender<SweepJob>, pod: Pod) -> Result<()> {
+async fn handle_pod(tx: mpsc::Sender<(String, String)>, pod: Pod) {
     let (name, namespace) = {
         let metadata = pod.metadata;
         (metadata.name.unwrap(), metadata.namespace.unwrap())
@@ -95,19 +92,14 @@ async fn handle_pod(tx: mpsc::Sender<SweepJob>, pod: Pod) -> Result<()> {
     if let Some(ip) = pod_ip {
         // TODO: add some details here in the trace. we might want to instrument
         // this whole span to see it clearly
-        tracing::info!(%ip, %namespace, %name, "sending pod over to sweeper");
-        let s = SweepJob {
-            id: format!("{}/{}", namespace, name),
-            ip,
-        };
-        match tx.send(s).await {
+        let id = format!("{}/{}", namespace, name);
+        tracing::info!(%id, %ip, "sending pod over to sweeper");
+        match tx.send((id, ip)).await {
             Ok(_) => tracing::info!("sent event"),
             Err(e) => tracing::error!(%e, "could not send event to sweeper"),
         }
         // send over mpsc
     }
-
-    Ok(())
 }
 
 fn check_container_terminated(containers: &Vec<ContainerStatus>) -> Option<()> {
