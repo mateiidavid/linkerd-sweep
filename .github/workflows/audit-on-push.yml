@@ -1,0 +1,21 @@
+name: Cargo Dependency Audit
+on: 
+  # Can schedule an audit or also do it on PRs here
+  push:
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      - 'deny.toml'
+      - 'rust-toolchain'
+jobs:
+  security_audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        name: Checkout code
+
+      - uses: actions-rs/audit-check@v1
+        name: Cargo Audit Check
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
