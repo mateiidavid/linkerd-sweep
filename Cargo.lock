@@ -634,7 +634,6 @@ name = "linkerd-sweep"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "futures",
  "k8s-openapi",
  "kube",
  "serde",
