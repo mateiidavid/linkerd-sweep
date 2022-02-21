@@ -1,0 +1,51 @@
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: linkerd-sweep
+  labels:
+    linkerd.io/extension: failover
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["list", "get", "watch"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: linkerd-sweep
+  labels:
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: linkerd-sweep
+subjects:
+- kind: ServiceAccount
+  name: linkerd-sweep
+  namespace: default
+---
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: linkerd-sweep
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: linkerd-sweep
+spec:
+  selector:
+    matchLabels:
+      app: linkerd-sweep
+  template:
+    metadata:
+      annotations:
+        linkerd.io/inject: enabled
+      labels:
+        app: linkerd-sweep
+    spec:
+      serviceAccountName: linkerd-sweep
+      containers:
+      - name: linkerd-sweep
+        image: linkerd-sweep:latest
+        imagePullPolicy: IfNotPresent
