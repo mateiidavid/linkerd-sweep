@@ -44,10 +44,16 @@ async fn main() -> Result<()> {
             .unwrap();
     });
 
+    //TODO: (matei)
+    // it works, but we process pods multiple times. how can we make sure
+    // they're processed only once? caching?
+    // request denied and unmeshed/untls'd requests because we send to the proxy
+    // port. what do healthchecks do here?
     let run_sweeper = tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             async move {
                 let (id, ip) = job;
+                tracing::info!(%id, %ip, "building shutdown request for job");
                 let req = {
                     let uri = hyper::Uri::builder()
                         .scheme(http::uri::Scheme::HTTP)
@@ -63,7 +69,10 @@ async fn main() -> Result<()> {
                 };
 
                 tracing::info!(%id, %ip, "sending shutdown request");
-                let _ = hyper::Client::default().request(req).await;
+                let resp = hyper::Client::default().request(req).await.expect("failed");
+                tracing::info!(%ip, "shutdown sent");
+                let status = resp.status();
+                tracing::info!(%status, "status");
             }
             .await
         }
