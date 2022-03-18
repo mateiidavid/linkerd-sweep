@@ -9,10 +9,10 @@ spec:
       annotations:
         linkerd.io/inject: enabled
         config.linkerd.io/default-inbound-policy: all-unauthenticated
-        config.linkerd.ioo/proxy-log-level: "linkerd=debug,warn"
+        config.linkerd.io/proxy-log-level: "linkerd=debug,warn"
       labels:
         app: client
-        proxy-sweep.io/enabled: "true"
+        linkerd.io/proxy-sweep: "true"
     spec:
       restartPolicy: Never
       containers:
