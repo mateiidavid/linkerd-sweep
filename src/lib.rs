@@ -4,12 +4,14 @@ use std::{
 };
 
 use futures::prelude::*;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
 use kube::{api::ResourceExt, runtime::watcher::Event};
 use tokio::sync::mpsc;
 
-type PodStore = Arc<Mutex<HashSet<(String, String)>>>;
-struct PodID(String, String);
+type PodStore = Arc<Mutex<HashSet<PodID>>>;
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct PodID(String, String);
 
 pub async fn process_pods<S>(events: S, store: PodStore, sender: mpsc::Sender<(PodID, String)>)
 where
@@ -27,18 +29,24 @@ async fn handle_pod(ev: Event<Pod>, store: PodStore, tx: mpsc::Sender<(PodID, St
             let pod_id = {
                 let namespace = pod.namespace().unwrap();
                 let name = pod.name();
-                (namespace, name)
+                PodID(namespace, name)
             };
 
-            let store = store.lock().unwrap();
-            if store.contains(&pod_id) {
-                tracing::debug!(?pod_id, "skipping pod update");
+            let injected = pod
+                .annotations()
+                .get("linkerd.io/inject")
+                .and_then(|v| Some(v == "enabled"))
+                .is_some();
+
+            let cached_pods = store.lock().unwrap();
+            if cached_pods.contains(&pod_id) || !injected {
+                tracing::debug!(%pod_id, "skipping pod update");
                 return;
             } else {
-                drop(store)
+                drop(cached_pods)
             }
 
-            tracing::info!(?pod_id, "handling pod");
+            tracing::info!(%pod_id, "handling pod");
             let pod_ip = pod.status.and_then(|status| {
                 let has_terminated = status
                     .container_statuses
@@ -51,8 +59,13 @@ async fn handle_pod(ev: Event<Pod>, store: PodStore, tx: mpsc::Sender<(PodID, St
                 // TODO: add some details here in the trace. we might want to instrument
                 // this whole span to see it clearly
                 tracing::info!(?pod_id, %ip, "sending pod over to sweeper");
-                match tx.send((pod_id, ip)).await {
-                    Ok(_) => tracing::info!("sent event"),
+                match tx.send((pod_id.clone(), ip)).await {
+                    Ok(_) => {
+                        tracing::info!("sent event");
+                        let mut cached_pods = store.lock().unwrap();
+                        cached_pods.insert(pod_id);
+                        drop(cached_pods);
+                    }
                     Err(e) => tracing::error!(%e, "could not send event to sweeper"),
                 }
                 // send over mpsc
@@ -69,8 +82,13 @@ fn check_container_terminated(containers: &Vec<ContainerStatus>) -> Option<()> {
         }
 
         let state = container.state.as_ref().unwrap();
-        if let Some(_) = &state.terminated {
-            tracing::info!(name = %container.name, "found terminated contaienr");
+        if let Some(terminated) = &state.terminated {
+            let exit_code = terminated.exit_code;
+            tracing::info!(%exit_code, name = %container.name, "found terminated container");
+            // Ignore failed containers?
+            if exit_code != 0 {
+                return None;
+            }
             return Some(());
         };
     }
