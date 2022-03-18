@@ -1,24 +1,42 @@
 use anyhow::Result;
+use clap::Parser;
 use futures::TryStreamExt;
 use hyper::http;
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
 use kube::{api::ListParams, runtime, Api, Client};
 use tokio::sync::mpsc;
 
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    /// Log level
+    #[clap(long, env = "SWEEP_CONTROLLER_LOG_LEVEL", default_value = "debug")]
+    log_level: kubert::LogFilter,
+
+    /// Log format (json | plain)
+    #[clap(long, default_value = "plain")]
+    log_format: kubert::LogFormat,
+
+    /// Port of the proxy where the shutdown signal should be sent
+    #[clap(short, long, default_value = "4191")]
+    port: u16,
+
+    #[clap(flatten)]
+    client: kubert::ClientArgs,
+
+    #[clap(flatten)]
+    admin: kubert::AdminArgs,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // copy&pasta eliza's set-up for tracing subscriber
-    use std::env;
-
-    use tracing_subscriber::{prelude::*, EnvFilter};
-
-    let log_filter = env::var("RUST_LOG")
-        .unwrap_or_else(|_| String::from("info,kube-runtime=debug,kube=debug"))
-        .parse::<EnvFilter>()?;
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(log_filter)
-        .init();
+    let Args {
+        log_level,
+        log_format,
+        port,
+        client,
+        admin,
+    } = Args::parse();
 
     let client = Client::try_default().await?;
     let api_pod = Api::<Pod>::all(client);
@@ -35,7 +53,6 @@ async fn main() -> Result<()> {
             .try_for_each(|pod| {
                 let sender = tx.clone();
                 async move {
-                    // TODO: Remove unwrap
                     handle_pod(sender, pod).await;
                     Ok(())
                 }
@@ -83,12 +100,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+// TODO: make sure pods are only processed once, don't want to send shutdown
+// signal to same pod 5 times.
 async fn handle_pod(tx: mpsc::Sender<(String, String)>, pod: Pod) {
     let (name, namespace) = {
         let metadata = pod.metadata;
         (metadata.name.unwrap(), metadata.namespace.unwrap())
     };
 
+    // if it's been cached don't process?
     tracing::info!(%namespace, %name, "handling pod");
     let pod_ip = pod.status.and_then(|status| {
         let has_terminated = status
