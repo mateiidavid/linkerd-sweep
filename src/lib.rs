@@ -3,7 +3,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use anyhow::Result;
 use futures::prelude::*;
+use hyper::{client, http};
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
 use kube::{api::ResourceExt, runtime::watcher::Event};
 use tokio::sync::mpsc;
@@ -94,6 +96,52 @@ fn check_container_terminated(containers: &Vec<ContainerStatus>) -> Option<()> {
     }
 
     None
+}
+
+pub struct Sweeper {
+    client: hyper::Client<client::HttpConnector>,
+    rx: mpsc::Receiver<(PodID, String)>,
+    store: PodStore,
+}
+
+impl Sweeper {
+    fn new(
+        client: hyper::Client<client::HttpConnector>,
+        rx: mpsc::Receiver<(PodID, String)>,
+        store: PodStore,
+    ) -> Self {
+        Self { client, rx, store }
+    }
+
+    async fn run(mut self, port: u16) -> Result<()> {
+        while let Some(job) = self.rx.recv().await {
+            let (id, ip) = job;
+            let shutdown_endpoint = format!("{}:{}", ip, &port);
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let req = {
+                    let uri = hyper::Uri::builder()
+                        .scheme(http::uri::Scheme::HTTP)
+                        .authority(shutdown_endpoint)
+                        .path_and_query("/shutdown")
+                        .build()
+                        .unwrap();
+                    http::Request::builder()
+                        .method(http::Method::POST)
+                        .uri(uri)
+                        .body(Default::default())
+                        .expect("shutdown request must be valid")
+                };
+
+                tracing::info!(%id, %ip, "sending shutdown request");
+                let resp = client.request(req).await.expect("failed");
+                tracing::info!(%ip, "shutdown sent");
+                let status = resp.status();
+                tracing::info!(%status, "status");
+            });
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for PodID {
