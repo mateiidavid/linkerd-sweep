@@ -1,11 +1,17 @@
 pub mod lib;
 
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
+
 use anyhow::Result;
 use clap::Parser;
 use futures::prelude::*;
 use hyper::http;
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
 use kube::{api::ListParams, runtime};
+use linkerd_sweep::Sweeper;
 use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
@@ -65,38 +71,14 @@ async fn main() -> Result<()> {
         }
     });
 
-    //TODO: (matei)
-    // it works, but we process pods multiple times. how can we make sure
-    // they're processed only once? caching?
-    // request denied and unmeshed/untls'd requests because we send to the proxy
-    // port. what do healthchecks do here?
-    let run_sweeper = tokio::spawn(async move {
-        while let Some(job) = rx.recv().await {
-            async move {
-                let (id, ip) = job;
-                tracing::info!(%id, %ip, "building shutdown request for job");
-                let req = {
-                    let uri = hyper::Uri::builder()
-                        .scheme(http::uri::Scheme::HTTP)
-                        .authority(format!("{}:4191", ip))
-                        .path_and_query("/shutdown")
-                        .build()
-                        .unwrap();
-                    http::Request::builder()
-                        .method(http::Method::POST)
-                        .uri(uri)
-                        .body(Default::default())
-                        .expect("shutdown request must be valid")
-                };
+    let store = Arc::new(Mutex::new(HashSet::new()));
+    let run_watcher = tokio::spawn(async move {
+        linkerd_sweep::process_pods(pods, store.clone(), tx);
+    });
 
-                tracing::info!(%id, %ip, "sending shutdown request");
-                let resp = hyper::Client::default().request(req).await.expect("failed");
-                tracing::info!(%ip, "shutdown sent");
-                let status = resp.status();
-                tracing::info!(%status, "status");
-            }
-            .await
-        }
+    let sweeper = Sweeper::new(hyper::Client::default(), rx, store.clone());
+    let run_sweeper = tokio::spawn(async move {
+        sweeper.run(port);
     });
 
     let _ = tokio::join!(run_watcher, run_sweeper);

@@ -105,7 +105,7 @@ pub struct Sweeper {
 }
 
 impl Sweeper {
-    fn new(
+    pub fn new(
         client: hyper::Client<client::HttpConnector>,
         rx: mpsc::Receiver<(PodID, String)>,
         store: PodStore,
@@ -113,11 +113,12 @@ impl Sweeper {
         Self { client, rx, store }
     }
 
-    async fn run(mut self, port: u16) -> Result<()> {
+    pub async fn run(mut self, port: u16) -> Result<()> {
         while let Some(job) = self.rx.recv().await {
             let (id, ip) = job;
             let shutdown_endpoint = format!("{}:{}", ip, &port);
             let client = self.client.clone();
+            let pod_store = self.store.clone();
             tokio::spawn(async move {
                 let req = {
                     let uri = hyper::Uri::builder()
@@ -138,6 +139,7 @@ impl Sweeper {
                 tracing::info!(%ip, "shutdown sent");
                 let status = resp.status();
                 tracing::info!(%status, "status");
+                pod_store.lock().unwrap().remove(&id);
             });
         }
         Ok(())
