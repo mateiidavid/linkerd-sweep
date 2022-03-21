@@ -1,10 +1,7 @@
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{anyhow, Result};
-use futures::prelude::*;
+use futures::{lock::Mutex, prelude::*};
 use hyper::{client, http};
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
 use kube::{api::ResourceExt, runtime::watcher::Event};
@@ -40,7 +37,7 @@ async fn handle_pod(ev: Event<Pod>, store: PodStore, tx: mpsc::Sender<(PodID, St
                 .and_then(|v| Some(v == "enabled"))
                 .is_some();
 
-            let cached_pods = store.lock().unwrap();
+            let cached_pods = store.lock().await;
             if cached_pods.contains(&pod_id) || !injected {
                 tracing::debug!(%pod_id, "skipping pod update");
                 return;
@@ -74,7 +71,7 @@ async fn handle_pod(ev: Event<Pod>, store: PodStore, tx: mpsc::Sender<(PodID, St
                 match tx.send((pod_id.clone(), ip)).await {
                     Ok(_) => {
                         tracing::info!("sent event");
-                        let mut cached_pods = store.lock().unwrap();
+                        let mut cached_pods = store.lock().await;
                         cached_pods.insert(pod_id);
                         drop(cached_pods);
                     }
@@ -153,7 +150,7 @@ impl Sweeper {
                 tracing::info!(%ip, "shutdown sent");
                 let status = resp.status();
                 tracing::info!(%status, "status");
-                pod_store.lock().unwrap().remove(&id);
+                pod_store.lock().await.remove(&id);
             });
         }
         Ok(())

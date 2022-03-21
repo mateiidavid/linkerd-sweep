@@ -1,16 +1,12 @@
 pub mod lib;
 
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
-use futures::prelude::*;
-use hyper::http;
-use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
-use kube::{api::ListParams, runtime};
+use futures::lock::Mutex;
+use k8s_openapi::api::core::v1::Pod;
+use kube::api::ListParams;
 use linkerd_sweep::Sweeper;
 use tokio::sync::mpsc;
 
@@ -53,33 +49,19 @@ async fn main() -> Result<()> {
         .build()
         .await?;
 
-    let (tx, mut rx) = mpsc::channel(100);
+    let (tx, rx) = mpsc::channel(100);
 
     let params = ListParams::default().labels("linkerd.io/sweep-proxy=true");
     let pods = rt.watch_all::<Pod>(params);
 
-    let run_watcher = tokio::spawn(async move {
-        tokio::pin!(pods);
-
-        let mut seen = std::collections::HashSet::<(String, String)>::new();
-        while let Some(ev) = pods.next().await {
-            match ev {
-                runtime::watcher::Event::Applied(_) => todo!(),
-                runtime::watcher::Event::Deleted(_) => todo!(),
-                runtime::watcher::Event::Restarted(_) => todo!(),
-            }
-        }
-    });
-
     let store = Arc::new(Mutex::new(HashSet::new()));
-    let run_watcher = tokio::spawn(async move {
-        linkerd_sweep::process_pods(pods, store.clone(), tx);
-    });
-
     let sweeper = Sweeper::new(hyper::Client::default(), rx, store.clone());
-    let run_sweeper = tokio::spawn(async move {
-        sweeper.run(port);
-    });
+    // TODO: Can't remove async block because anyhow does not impl futures. Can we
+    // switch to Boxed err instead?
+    let run_sweeper = tokio::spawn(async move { sweeper.run(port).await });
+
+    let run_watcher =
+        tokio::spawn(async move { linkerd_sweep::process_pods(pods, store, tx).await });
 
     let _ = tokio::join!(run_watcher, run_sweeper);
 
