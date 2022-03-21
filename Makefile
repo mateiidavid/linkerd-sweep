@@ -1,9 +1,7 @@
 TAG ?= latest
 CLUSTER_NAME ?= dev
 
-all:
-	build
-	import
+all: build import
 
 .PHONY: build
 build: ## build image
