@@ -1,13 +1,10 @@
-pub mod lib;
-
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
 use futures::lock::Mutex;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::ListParams;
-use linkerd_sweep::Sweeper;
 use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
@@ -25,10 +22,6 @@ struct Args {
     #[clap(long, default_value = "plain")]
     log_format: kubert::LogFormat,
 
-    /// Port of the proxy where the shutdown signal should be sent
-    #[clap(short, long, default_value = "4191")]
-    port: u16,
-
     #[clap(flatten)]
     client: kubert::ClientArgs,
 
@@ -41,7 +34,6 @@ async fn main() -> Result<()> {
     let Args {
         log_level,
         log_format,
-        port,
         client,
         admin,
     } = Args::parse();
@@ -53,23 +45,10 @@ async fn main() -> Result<()> {
         .build()
         .await?;
 
-    let (tx, rx) = mpsc::channel(100);
-
-    tracing::info!("Hello!");
-    let params = ListParams::default().labels("linkerd.io/sweep-proxy=true");
-    let pods = rt.watch_all::<Pod>(params);
-
-    let store = Arc::new(Mutex::new(HashSet::new()));
-    let sweeper = Sweeper::new(hyper::Client::default(), rx, store.clone());
-    // TODO: Can't remove async block because anyhow does not impl futures. Can we
-    // switch to Boxed err instead?
-    let run_sweeper = tokio::spawn(async move { sweeper.run(port).await });
-
-    let run_watcher =
-        tokio::spawn(async move { linkerd_sweep::process_pods(pods, store, tx).await });
-
-    let _ = tokio::join!(run_watcher, run_sweeper);
-
+    let client = kube::client::Client::try_default().await?;
+    let addr = SocketAddr::from(([0, 0, 0, 0], 443));
+    let server = linkerd_sweep::server::AdmissionServer::new(client, addr);
+    tokio::spawn(server.run());
     Ok(())
 }
 

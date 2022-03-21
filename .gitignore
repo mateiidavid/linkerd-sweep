@@ -1,1 +1,3 @@
 /target
+/k8s
+k8s/deploy.yaml
