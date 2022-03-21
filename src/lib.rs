@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures::prelude::*;
 use hyper::{client, http};
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
@@ -53,14 +53,24 @@ async fn handle_pod(ev: Event<Pod>, store: PodStore, tx: mpsc::Sender<(PodID, St
                 let has_terminated = status
                     .container_statuses
                     .as_ref()
-                    .and_then(|s| check_container_terminated(s));
-                has_terminated.and(status.pod_ip)
+                    .ok_or(anyhow!("no container statuses found"))
+                    .map(|c| match check_container_terminated(c) {
+                        Err(e) => {
+                            tracing::error!(%pod_id, "error handling pod: {}", e);
+                        }
+                        _ => {}
+                    })
+                    .is_ok();
+                // bit annoying, convert bool to opt to use 'and' combinator for
+                // pod_ip. If container has terminated then we can proceed with
+                // ip
+                has_terminated.then(|| true).and(status.pod_ip)
             });
 
             if let Some(ip) = pod_ip {
                 // TODO: add some details here in the trace. we might want to instrument
                 // this whole span to see it clearly
-                tracing::info!(?pod_id, %ip, "sending pod over to sweeper");
+                tracing::info!(%pod_id, %ip, "sending pod over to sweeper");
                 match tx.send((pod_id.clone(), ip)).await {
                     Ok(_) => {
                         tracing::info!("sent event");
@@ -77,7 +87,7 @@ async fn handle_pod(ev: Event<Pod>, store: PodStore, tx: mpsc::Sender<(PodID, St
     }
 }
 
-fn check_container_terminated(containers: &Vec<ContainerStatus>) -> Option<()> {
+fn check_container_terminated(containers: &Vec<ContainerStatus>) -> Result<()> {
     for container in containers {
         if container.name == "linkerd-proxy" {
             continue;
@@ -89,13 +99,17 @@ fn check_container_terminated(containers: &Vec<ContainerStatus>) -> Option<()> {
             tracing::info!(%exit_code, name = %container.name, "found terminated container");
             // Ignore failed containers?
             if exit_code != 0 {
-                return None;
+                tracing::debug!(%exit_code, name = %container.name, "ignoring failed container");
+                return Err(anyhow!(format!(
+                    "container {} failed with exit status {}",
+                    container.name, exit_code,
+                )));
             }
-            return Some(());
+            return Ok(());
         };
     }
 
-    None
+    Err(anyhow!(format!("no terminated containers found")))
 }
 
 pub struct Sweeper {
