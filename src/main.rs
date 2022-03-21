@@ -14,7 +14,11 @@ use tokio::sync::mpsc;
 #[clap(author, version, about, long_about = None)]
 struct Args {
     /// Log level
-    #[clap(long, env = "SWEEP_CONTROLLER_LOG_LEVEL", default_value = "debug")]
+    #[clap(
+        long,
+        env = "LINKERD_SWEEP_LOG_LEVEL",
+        default_value = "linkerd_sweep=debug,kubert=info,warn"
+    )]
     log_level: kubert::LogFilter,
 
     /// Log format (json | plain)
@@ -51,6 +55,7 @@ async fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::channel(100);
 
+    tracing::info!("Hello!");
     let params = ListParams::default().labels("linkerd.io/sweep-proxy=true");
     let pods = rt.watch_all::<Pod>(params);
 

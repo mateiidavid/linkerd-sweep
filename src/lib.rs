@@ -125,6 +125,7 @@ impl Sweeper {
     }
 
     pub async fn run(mut self, port: u16) -> Result<()> {
+        tracing::info!("running sweeper");
         while let Some(job) = self.rx.recv().await {
             let (id, ip) = job;
             let shutdown_endpoint = format!("{}:{}", ip, &port);

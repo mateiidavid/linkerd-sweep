@@ -8,11 +8,10 @@ spec:
     metadata:
       annotations:
         linkerd.io/inject: enabled
-        config.linkerd.io/default-inbound-policy: all-unauthenticated
         config.linkerd.io/proxy-log-level: "linkerd=debug,warn"
       labels:
         app: client
-        linkerd.io/proxy-sweep: "true"
+        linkerd.io/sweep-proxy: "true"
     spec:
       restartPolicy: Never
       containers:
@@ -31,5 +30,21 @@ spec:
   podSelector:
     matchLabels:
       app: client
-  port: 4191
+  port: linkerd-admin
+  proxyProtocol: HTTP/1
+---
+apiVersion: policy.linkerd.io/v1beta1
+kind: ServerAuthorization
+metadata:
+  name: proxy-admin
+  labels:
+    app: curl-sleep
+spec:
+  server:
+    selector:
+      matchLabels:
+        app: curl-sleep
+  client:
+    unauthenticated: true
+
 
