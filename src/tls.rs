@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use std::{io::BufReader, path::PathBuf, sync::Arc};
 use tokio::fs;
 
-async fn load_certificate(path: &PathBuf) -> Result<Vec<rustls::Certificate>> {
+pub async fn load_certificate(path: &PathBuf) -> Result<Vec<rustls::Certificate>> {
     let file = fs::read(path).await?;
     let mut reader = BufReader::new(file.as_slice());
 
@@ -17,7 +17,7 @@ async fn load_certificate(path: &PathBuf) -> Result<Vec<rustls::Certificate>> {
     Ok(certs.into_iter().map(rustls::Certificate).collect())
 }
 
-async fn load_keys(path: &PathBuf) -> Result<rustls::PrivateKey> {
+pub async fn load_keys(path: &PathBuf) -> Result<rustls::PrivateKey> {
     let file = fs::read(path).await?;
     let mut reader = BufReader::new(file.as_slice());
 
@@ -29,7 +29,7 @@ async fn load_keys(path: &PathBuf) -> Result<rustls::PrivateKey> {
     Ok(rustls::PrivateKey(keys.remove(0)))
 }
 
-async fn mk_tls_connector(
+pub async fn mk_tls_connector(
     cert_path: &PathBuf,
     key_path: &PathBuf,
 ) -> Result<tokio_rustls::TlsAcceptor> {
@@ -45,4 +45,3 @@ async fn mk_tls_connector(
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::from(cfg));
     Ok(tls_acceptor)
 }
-

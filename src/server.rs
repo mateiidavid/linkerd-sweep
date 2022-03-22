@@ -1,29 +1,40 @@
-use std::net::SocketAddr;
+use core::task;
+use std::{net::SocketAddr, path::PathBuf};
 
-use tokio::net::TcpListener;
-
-// Steps:
-// 1. Bind TCP using tokio, accept
-// 2. Once connection is established, do TLS
-// 3. Serve
+use crate::tls;
+use anyhow::Context;
+use futures::{future, TryFutureExt};
+use hyper::{server::conn::Http, service::Service, Response};
+use hyper::{Body, Request};
+use tokio::net::{TcpListener, TcpStream};
+use tracing::{info_span, Instrument};
 
 pub struct AdmissionServer {
     client: kube::client::Client,
     bind_addr: SocketAddr,
+    cert_path: PathBuf,
+    key_path: PathBuf,
 }
 
 impl AdmissionServer {
     pub fn new(client: kube::client::Client, bind_addr: SocketAddr) -> Self {
-        Self { client, bind_addr }
+        Self {
+            client,
+            bind_addr,
+            cert_path: PathBuf::from("/var/run/sweep/tls.crt"),
+            key_path: PathBuf::from("/var/run/sweep/key.crt"),
+        }
     }
 
     pub async fn run(self) {
+        tracing::info!("running, boss");
         let listener = TcpListener::bind(&self.bind_addr)
             .await
             .expect("listener should be created successfully");
-        let local_addr = listener.local_addr().expect("can't get local addr");
+        let _local_addr = listener.local_addr().expect("can't get local addr");
 
         loop {
+            tracing::info!("loopin, boss");
             let socket = match listener.accept().await {
                 Ok((socket, _)) => socket,
                 Err(err) => {
@@ -32,13 +43,71 @@ impl AdmissionServer {
                 }
             };
 
-            let client_addr = match socket.peer_addr() {
+            let peer_addr = match socket.peer_addr() {
                 Ok(addr) => addr,
                 Err(err) => {
                     tracing::error!(%err, "Failed to get peer addr");
                     continue;
                 }
             };
+
+            tokio::spawn(
+                Self::handle_conn(
+                    socket,
+                    self.client.clone(),
+                    self.cert_path.clone(),
+                    self.key_path.clone(),
+                )
+                .map_err(|err| tracing::error!(%err))
+                .instrument(info_span!("connection", peer.addr = %peer_addr)),
+            );
         }
+    }
+
+    async fn handle_conn(
+        socket: TcpStream,
+        client: kube::client::Client,
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    ) -> anyhow::Result<()> {
+        tracing::info!("buildin a conn");
+        // Build TLS Connector
+        let tls = tls::mk_tls_connector(&cert_path, &key_path)
+            .await
+            .with_context(|| "failed to build TLS")?;
+        // Build TLS conn
+        let stream = tls.accept(socket).await.with_context(|| "TLS Error")?;
+        match Http::new()
+            .serve_connection(stream, Handler { client })
+            .await
+        {
+            Ok(_) => todo!(),
+            Err(_) => todo!(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Handler {
+    client: kube::client::Client,
+}
+
+impl Service<Request<Body>> for Handler {
+    type Response = Response<Body>;
+
+    type Error = anyhow::Error;
+
+    type Future = future::BoxFuture<'static, anyhow::Result<Response<Body>>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        tracing::info!(?req, "got a request, boss");
+        Box::pin(async { Ok(Response::builder().status(200).body(Body::empty()).unwrap()) })
     }
 }
