@@ -2,7 +2,7 @@ use core::task;
 use std::{net::SocketAddr, path::PathBuf};
 
 use crate::tls;
-use anyhow::Context;
+use anyhow::{anyhow, Context, Result};
 use futures::{future, TryFutureExt};
 use hyper::{server::conn::Http, service::Service, Response};
 use hyper::{Body, Request};
@@ -22,7 +22,7 @@ impl AdmissionServer {
             client,
             bind_addr,
             cert_path: PathBuf::from("/var/run/sweep/tls.crt"),
-            key_path: PathBuf::from("/var/run/sweep/key.crt"),
+            key_path: PathBuf::from("/var/run/sweep/tls.key"),
         }
     }
 
@@ -69,12 +69,16 @@ impl AdmissionServer {
         client: kube::client::Client,
         cert_path: PathBuf,
         key_path: PathBuf,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         tracing::info!("buildin a conn");
         // Build TLS Connector
-        let tls = tls::mk_tls_connector(&cert_path, &key_path)
-            .await
-            .with_context(|| "failed to build TLS")?;
+        let tls = match tls::mk_tls_connector(&cert_path, &key_path).await {
+            Ok(tls) => tls,
+            Err(err) => {
+                tracing::error!(%err, "failed to build tls connector");
+                return Err(anyhow!("could not establish TLS connection"));
+            }
+        };
         // Build TLS conn
         let stream = tls.accept(socket).await.with_context(|| "TLS Error")?;
         match Http::new()
