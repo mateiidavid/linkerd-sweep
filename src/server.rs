@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use futures::{future, TryFutureExt};
 use hyper::{server::conn::Http, service::Service, Response};
 use hyper::{Body, Request};
+use kube::core::{admission::AdmissionReview, DynamicObject};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info_span, Instrument};
 
@@ -86,8 +87,10 @@ impl AdmissionServer {
             .await
         {
             Ok(_) => todo!(),
-            Err(_) => todo!(),
+            Err(err) => tracing::error!(%err, "failed to process admission request"),
         }
+
+        Ok(())
     }
 }
 
@@ -112,6 +115,17 @@ impl Service<Request<Body>> for Handler {
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         tracing::info!(?req, "got a request, boss");
-        Box::pin(async { Ok(Response::builder().status(200).body(Body::empty()).unwrap()) })
+        Box::pin(async {
+            tracing::info!("PROCESSING STARTED");
+            let review: AdmissionReview<DynamicObject> = {
+                let bytes = hyper::body::to_bytes(req.into_body())
+                    .await
+                    .with_context(|| "Failed to convert request body to bytes")?;
+                tracing::info!(?bytes, "BYTEZ");
+                serde_json::from_slice(&bytes)
+                    .with_context(|| "Failed to deserialize request body bytes to json")?
+            };
+            Ok(Response::builder().status(200).body(Body::empty()).unwrap())
+        })
     }
 }
