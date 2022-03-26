@@ -16,7 +16,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info_span, Instrument};
 
 pub struct AdmissionServer {
-    client: kube::client::Client,
     bind_addr: SocketAddr,
     cert_path: PathBuf,
     key_path: PathBuf,
@@ -26,9 +25,8 @@ const JOB_KIND: &'static str = k8s_openapi::api::batch::v1::Job::KIND;
 const JOB_GROUP: &'static str = k8s_openapi::api::batch::v1::Job::GROUP;
 
 impl AdmissionServer {
-    pub fn new(client: kube::client::Client, bind_addr: SocketAddr) -> Self {
+    pub fn new(bind_addr: SocketAddr) -> Self {
         Self {
-            client,
             bind_addr,
             cert_path: PathBuf::from("/var/run/sweep/tls.crt"),
             key_path: PathBuf::from("/var/run/sweep/tls.key"),
@@ -61,24 +59,14 @@ impl AdmissionServer {
             };
 
             tokio::spawn(
-                Self::handle_conn(
-                    socket,
-                    self.client.clone(),
-                    self.cert_path.clone(),
-                    self.key_path.clone(),
-                )
-                .map_err(|err| tracing::error!(%err))
-                .instrument(info_span!("connection", peer.addr = %peer_addr)),
+                Self::handle_conn(socket, self.cert_path.clone(), self.key_path.clone())
+                    .map_err(|err| tracing::error!(%err))
+                    .instrument(info_span!("connection", peer.addr = %peer_addr)),
             );
         }
     }
 
-    async fn handle_conn(
-        socket: TcpStream,
-        client: kube::client::Client,
-        cert_path: PathBuf,
-        key_path: PathBuf,
-    ) -> Result<()> {
+    async fn handle_conn(socket: TcpStream, cert_path: PathBuf, key_path: PathBuf) -> Result<()> {
         tracing::info!("buildin a conn");
         // Build TLS Connector
         let tls = match tls::mk_tls_connector(&cert_path, &key_path).await {
@@ -91,7 +79,7 @@ impl AdmissionServer {
         // Build TLS conn
         let stream = tls.accept(socket).await.with_context(|| "TLS Error")?;
         match Http::new()
-            .serve_connection(stream, Handler::new(client))
+            .serve_connection(stream, Handler::new())
             .instrument(info_span!("admission.request"))
             .await
         {
@@ -104,9 +92,7 @@ impl AdmissionServer {
 }
 
 #[derive(Clone)]
-struct Handler {
-    client: kube::client::Client,
-}
+struct Handler;
 
 impl Service<Request<Body>> for Handler {
     type Response = Response<Body>;
@@ -126,10 +112,8 @@ impl Service<Request<Body>> for Handler {
     // response (i.e denied). Also do it if review.try_into doesn't work. For
     // now, we return an err
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        tracing::info!(?req, "got a request, boss");
         let handler = self.clone();
         Box::pin(async {
-            tracing::info!("PROCESSING STARTED");
             let review: AdmissionReview<DynamicObject> = {
                 let bytes = hyper::body::to_bytes(req.into_body())
                     .await
@@ -139,14 +123,12 @@ impl Service<Request<Body>> for Handler {
                     .with_context(|| "Failed to deserialize request body bytes to json")?
             };
             tracing::trace!("Admission Review: {:?}", review);
-            // Check request, extract job object, check annotations.
             let rsp = match review.try_into() {
                 Ok(req) => handler.process_request(req),
                 Err(err) => return Err(anyhow!("invalid admission request: {}", err)),
             };
             //  * quick validation: does main container match a container in the
             //  template spec? if not err out
-            // Annotations good? Then begin JSONPATCH
             // JSONPATCH: add emptydir volume with init container for linkerd-await command: curl
             // binary or smth
             // JSONPATCH: add entrypoint to main container
@@ -156,8 +138,8 @@ impl Service<Request<Body>> for Handler {
 }
 
 impl Handler {
-    fn new(client: kube::Client) -> Self {
-        Self { client }
+    fn new() -> Self {
+        Self
     }
 
     fn process_request(self, req: AdmissionRequest<DynamicObject>) -> AdmissionResponse {
@@ -166,6 +148,7 @@ impl Handler {
             return AdmissionResponse::invalid(format!("invalid AdmissionRequest: {}", err));
         }
 
+        let rsp = AdmissionResponse::from(&req);
         let (metadata, spec, id) = match parse_request(req) {
             Ok(v) => v,
             Err(err) => {
@@ -181,12 +164,7 @@ impl Handler {
             Ok(v) => v,
             Err(err) => {
                 tracing::debug!("skipping mutation on Job [{}]: {}", &id, err);
-                // TODO: change this to be valid since we skip it, we should let
-                // the pods be created
-                return AdmissionResponse::invalid(format!(
-                    "Job {} is not configured to be swept: {}",
-                    id, err
-                ));
+                return rsp;
             }
         };
 

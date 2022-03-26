@@ -45,11 +45,8 @@ async fn main() -> Result<()> {
         .build()
         .await?;
 
-    tracing::info!("hallo");
-    let client = kube::client::Client::try_default().await?;
-    tracing::info!("is it client?");
     let addr = SocketAddr::from(([0, 0, 0, 0], 443));
-    let server = linkerd_sweep::server::AdmissionServer::new(client, addr);
+    let server = linkerd_sweep::server::AdmissionServer::new(addr);
     server.run().await;
     Ok(())
 }
