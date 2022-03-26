@@ -1,4 +1,5 @@
 use core::task;
+use std::convert::{TryFrom, TryInto};
 use std::{net::SocketAddr, path::PathBuf};
 
 use crate::tls;
@@ -6,6 +7,10 @@ use anyhow::{anyhow, Context, Result};
 use futures::{future, TryFutureExt};
 use hyper::{server::conn::Http, service::Service, Response};
 use hyper::{Body, Request};
+use k8s_openapi::api::batch::v1::JobSpec;
+use k8s_openapi::Resource;
+use kube::core::admission::{AdmissionRequest, AdmissionResponse};
+use kube::core::ObjectMeta;
 use kube::core::{admission::AdmissionReview, DynamicObject};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info_span, Instrument};
@@ -16,6 +21,9 @@ pub struct AdmissionServer {
     cert_path: PathBuf,
     key_path: PathBuf,
 }
+
+const JOB_KIND: &'static str = k8s_openapi::api::batch::v1::Job::KIND;
+const JOB_GROUP: &'static str = k8s_openapi::api::batch::v1::Job::GROUP;
 
 impl AdmissionServer {
     pub fn new(client: kube::client::Client, bind_addr: SocketAddr) -> Self {
@@ -83,7 +91,8 @@ impl AdmissionServer {
         // Build TLS conn
         let stream = tls.accept(socket).await.with_context(|| "TLS Error")?;
         match Http::new()
-            .serve_connection(stream, Handler { client })
+            .serve_connection(stream, Handler::new(client))
+            .instrument(info_span!("admission.request"))
             .await
         {
             Ok(_) => todo!(),
@@ -113,8 +122,12 @@ impl Service<Request<Body>> for Handler {
         task::Poll::Ready(Ok(()))
     }
 
+    // TODO: if we can't deserialize from bytez to json, return bad admission
+    // response (i.e denied). Also do it if review.try_into doesn't work. For
+    // now, we return an err
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         tracing::info!(?req, "got a request, boss");
+        let handler = self.clone();
         Box::pin(async {
             tracing::info!("PROCESSING STARTED");
             let review: AdmissionReview<DynamicObject> = {
@@ -125,7 +138,142 @@ impl Service<Request<Body>> for Handler {
                 serde_json::from_slice(&bytes)
                     .with_context(|| "Failed to deserialize request body bytes to json")?
             };
+            tracing::trace!("Admission Review: {:?}", review);
+            // Check request, extract job object, check annotations.
+            let rsp = match review.try_into() {
+                Ok(req) => handler.process_request(req),
+                Err(err) => return Err(anyhow!("invalid admission request: {}", err)),
+            };
+            //  * quick validation: does main container match a container in the
+            //  template spec? if not err out
+            // Annotations good? Then begin JSONPATCH
+            // JSONPATCH: add emptydir volume with init container for linkerd-await command: curl
+            // binary or smth
+            // JSONPATCH: add entrypoint to main container
             Ok(Response::builder().status(200).body(Body::empty()).unwrap())
         })
+    }
+}
+
+impl Handler {
+    fn new(client: kube::Client) -> Self {
+        Self { client }
+    }
+
+    fn process_request(self, req: AdmissionRequest<DynamicObject>) -> AdmissionResponse {
+        if let Err(err) = check_request_kind(&req) {
+            tracing::error!("invalid AdmissionRequest: {}", err);
+            return AdmissionResponse::invalid(format!("invalid AdmissionRequest: {}", err));
+        }
+
+        let (metadata, spec, id) = match parse_request(req) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!("invalid AdmissionRequest: {}", err);
+                return AdmissionResponse::invalid(format!(
+                    "Error parsing AdmissionRequest: {}",
+                    err
+                ));
+            }
+        };
+
+        let sweep_name = match get_container_name(metadata) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::debug!("skipping mutation on Job [{}]: {}", &id, err);
+                // TODO: change this to be valid since we skip it, we should let
+                // the pods be created
+                return AdmissionResponse::invalid(format!(
+                    "Job {} is not configured to be swept: {}",
+                    id, err
+                ));
+            }
+        };
+
+        AdmissionResponse::invalid("err")
+    }
+}
+
+// Check whether we are dealing with a Job
+fn check_request_kind(req: &AdmissionRequest<DynamicObject>) -> Result<()> {
+    if req.kind.kind != JOB_KIND || req.kind.group != JOB_GROUP {
+        return Err(anyhow!(
+            "AdmissionRequest group or kind is invalid: {:?}.{:?}",
+            req.kind.group,
+            req.kind.kind
+        ));
+    }
+
+    Ok(())
+}
+
+fn get_container_name(meta: ObjectMeta) -> Result<String> {
+    let annotations = meta
+        .annotations
+        .ok_or_else(|| anyhow!("ObjectMetadata is missing annotations"))?;
+    let value = annotations
+        .get("linkerd.io/inject")
+        .map(|str| str.to_owned())
+        .ok_or_else(|| anyhow!("Inject annotation is missing from ObjectMetadata"))?;
+
+    if value != "enable" {
+        return Err(anyhow!("linkerd injection is disabled"));
+    }
+
+    let container_name = {
+        let name = annotations
+            .get("extensions.linkerd.io/sweep-container")
+            .map(|str| str.to_owned())
+            .ok_or_else(|| anyhow!("Sweep annotation is missing from ObjectMetadata"))?;
+        if name.is_empty() {
+            return Err(anyhow!("no container has been named to be swept"));
+        }
+        name
+    };
+
+    Ok(container_name)
+}
+
+fn parse_request(req: AdmissionRequest<DynamicObject>) -> Result<(ObjectMeta, JobSpec, JobID)> {
+    let obj = req
+        .object
+        .ok_or_else(|| anyhow!("AdmissionRequest missing 'object' field"))?;
+
+    let meta = obj.metadata;
+    let job_spec = {
+        let json_spec = obj
+            .data
+            .get("spec")
+            .cloned()
+            .ok_or_else(|| anyhow!("AdmissionRequest object missing 'spec' field"))?;
+        serde_json::from_value(json_spec)
+            .map_err(|err| anyhow!("Error deserializing object 'spec' to 'Job': {}", err))?
+    };
+
+    let id = JobID::try_from(&meta)?;
+    Ok((meta, job_spec, id))
+}
+
+struct JobID(String, String);
+
+impl std::fmt::Display for JobID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.0, self.1)
+    }
+}
+
+impl TryFrom<&ObjectMeta> for JobID {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &ObjectMeta) -> Result<Self, Self::Error> {
+        let name = value
+            .name
+            .as_ref()
+            .ok_or_else(|| anyhow!("ObjectMetadata is missing its 'name' field"))?;
+        let ns = value
+            .namespace
+            .as_ref()
+            .ok_or_else(|| anyhow!("ObjectMetadata is missing its 'namespace' field"))?;
+        Ok(JobID(ns.to_string(), name.to_string()))
     }
 }
