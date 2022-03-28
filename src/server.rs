@@ -5,8 +5,8 @@ use std::{net::SocketAddr, path::PathBuf};
 use crate::tls;
 use anyhow::{anyhow, Context, Result};
 use futures::{future, TryFutureExt};
+use hyper::{http, Body, Request};
 use hyper::{server::conn::Http, service::Service, Response};
-use hyper::{Body, Request};
 use k8s_openapi::api::batch::v1::JobSpec;
 use k8s_openapi::Resource;
 use kube::core::admission::{AdmissionRequest, AdmissionResponse};
@@ -83,7 +83,7 @@ impl AdmissionServer {
             .instrument(info_span!("admission.request"))
             .await
         {
-            Ok(_) => todo!(),
+            Ok(c) => tracing::info!("connection successful"),
             Err(err) => tracing::error!(%err, "failed to process admission request"),
         }
 
@@ -118,13 +118,12 @@ impl Service<Request<Body>> for Handler {
                 let bytes = hyper::body::to_bytes(req.into_body())
                     .await
                     .with_context(|| "Failed to convert request body to bytes")?;
-                tracing::info!(?bytes, "BYTEZ");
                 serde_json::from_slice(&bytes)
                     .with_context(|| "Failed to deserialize request body bytes to json")?
             };
             tracing::trace!("Admission Review: {:?}", review);
             let rsp = match review.try_into() {
-                Ok(req) => handler.process_request(req),
+                Ok(req) => handler.process_request(req).into_review(),
                 Err(err) => return Err(anyhow!("invalid admission request: {}", err)),
             };
             //  * quick validation: does main container match a container in the
@@ -132,7 +131,13 @@ impl Service<Request<Body>> for Handler {
             // JSONPATCH: add emptydir volume with init container for linkerd-await command: curl
             // binary or smth
             // JSONPATCH: add entrypoint to main container
-            Ok(Response::builder().status(200).body(Body::empty()).unwrap())
+
+            let bytez = serde_json::to_vec(&rsp)?;
+            Ok(Response::builder()
+                .status(http::StatusCode::OK)
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(hyper::Body::from(bytez))
+                .unwrap())
         })
     }
 }
@@ -168,7 +173,12 @@ impl Handler {
             }
         };
 
-        AdmissionResponse::invalid("err")
+        let patch = {
+            let patches = create_patch().expect("failed to construct patches");
+            tracing::info!(?patches, "patches");
+            json_patch::Patch(patches)
+        };
+        rsp.with_patch(patch).expect("failed to patch")
     }
 }
 
@@ -189,12 +199,13 @@ fn get_container_name(meta: ObjectMeta) -> Result<String> {
     let annotations = meta
         .annotations
         .ok_or_else(|| anyhow!("ObjectMetadata is missing annotations"))?;
+    // TODO: check spec not container for this annotation
     let value = annotations
         .get("linkerd.io/inject")
         .map(|str| str.to_owned())
         .ok_or_else(|| anyhow!("Inject annotation is missing from ObjectMetadata"))?;
 
-    if value != "enable" {
+    if value != "enabled" {
         return Err(anyhow!("linkerd injection is disabled"));
     }
 
@@ -253,5 +264,84 @@ impl TryFrom<&ObjectMeta> for JobID {
             .as_ref()
             .ok_or_else(|| anyhow!("ObjectMetadata is missing its 'namespace' field"))?;
         Ok(JobID(ns.to_string(), name.to_string()))
+    }
+}
+
+fn create_patch_add(path: &str, value: serde_json::Value) -> json_patch::AddOperation {
+    json_patch::AddOperation {
+        path: path.into(),
+        value,
+    }
+}
+
+fn create_patch() -> Result<Vec<json_patch::PatchOperation>> {
+    let volume = {
+        let vol = create_volume();
+        serde_json::to_string(&vol)?
+    };
+
+    let init = {
+        let c = create_init_container();
+        serde_json::to_string(&c)?
+    };
+
+    let mount = {
+        let m = create_volume_mount();
+        serde_json::to_string(&m)?
+    };
+
+    Ok(vec![
+        json_patch::PatchOperation::Add(create_patch_add(
+            "/spec/template/spec/initContainers",
+            serde_json::json!({}),
+        )),
+        json_patch::PatchOperation::Add(create_patch_add(
+            "/spec/template/spec/volumes",
+            serde_json::json!({}),
+        )),
+        json_patch::PatchOperation::Add(create_patch_add(
+            "/spec/template/spec/volumes/-",
+            serde_json::json!(volume),
+        )),
+        json_patch::PatchOperation::Add(create_patch_add(
+            "/spec/template/spec/initContainers/-",
+            serde_json::json!(mount.clone()),
+        )),
+        //TODO: need to re-apply whole container object, can't just append
+        //volume at its path, cant idnex using jsonpatch
+        json_patch::PatchOperation::Add(create_patch_add(
+            "/spec/template/spec/containers/-",
+            serde_json::json!(mount),
+        )),
+    ])
+}
+
+fn create_volume() -> k8s_openapi::api::core::v1::Volume {
+    k8s_openapi::api::core::v1::Volume {
+        name: String::from("linkerd-await"),
+        empty_dir: Some(Default::default()),
+        ..Default::default()
+    }
+}
+
+fn create_init_container() -> k8s_openapi::api::core::v1::Container {
+    k8s_openapi::api::core::v1::Container {
+        name: String::from("linkerd-await"),
+        image: Some(String::from("docker.io/matei207/linkerd-await:v0.0.1")),
+        command: Some(vec![String::from("cp")]),
+        args: Some(vec![
+            String::from("/tmp/linkerd-await"),
+            String::from("/linkerd-await"),
+        ]),
+        volume_mounts: Some(vec![create_volume_mount()]),
+        ..Default::default()
+    }
+}
+
+fn create_volume_mount() -> k8s_openapi::api::core::v1::VolumeMount {
+    k8s_openapi::api::core::v1::VolumeMount {
+        mount_path: String::from("/linkerd"),
+        name: String::from("linkerd-await"),
+        ..Default::default()
     }
 }

@@ -739,6 +739,7 @@ dependencies = [
  "clap",
  "futures",
  "hyper",
+ "json-patch",
  "k8s-openapi",
  "kube",
  "kubert",
