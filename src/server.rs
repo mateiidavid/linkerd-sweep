@@ -2,6 +2,7 @@ use core::task;
 use std::convert::{TryFrom, TryInto};
 use std::{net::SocketAddr, path::PathBuf};
 
+use crate::patch::MakePatch;
 use crate::tls;
 use anyhow::{anyhow, bail, Context, Result};
 use futures::{future, TryFutureExt};
@@ -123,7 +124,7 @@ impl Service<Request<Body>> for Handler {
             };
             tracing::trace!("Admission Review: {:?}", review);
             let rsp = match review.try_into() {
-                Ok(req) => handler.process_request(req).into_review(),
+                Ok(req) => handler.process_request(req).await.into_review(),
                 Err(err) => return Err(anyhow!("invalid admission request: {}", err)),
             };
             //  * quick validation: does main container match a container in the
@@ -180,6 +181,10 @@ impl Handler {
             }
         };
 
+        let patch = {
+            let spec = pod_template.spec.unwrap();
+            let patcher = MakePatch::new(sweep_name, spec);
+        }
         /*
         let patch = {
             let patches = create_patch().expect("failed to construct patches");
