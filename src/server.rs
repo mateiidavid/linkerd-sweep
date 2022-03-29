@@ -3,17 +3,17 @@ use std::convert::{TryFrom, TryInto};
 use std::{net::SocketAddr, path::PathBuf};
 
 use crate::tls;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures::{future, TryFutureExt};
 use hyper::{http, Body, Request};
 use hyper::{server::conn::Http, service::Service, Response};
-use k8s_openapi::api::batch::v1::JobSpec;
+use k8s_openapi::api::core::v1::PodTemplateSpec;
 use k8s_openapi::Resource;
 use kube::core::admission::{AdmissionRequest, AdmissionResponse};
 use kube::core::ObjectMeta;
 use kube::core::{admission::AdmissionReview, DynamicObject};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info_span, Instrument};
+use tracing::{debug, debug_span, info_span, trace, Instrument};
 
 pub struct AdmissionServer {
     bind_addr: SocketAddr,
@@ -147,14 +147,17 @@ impl Handler {
         Self
     }
 
-    fn process_request(self, req: AdmissionRequest<DynamicObject>) -> AdmissionResponse {
+    async fn process_request(self, req: AdmissionRequest<DynamicObject>) -> AdmissionResponse {
         if let Err(err) = check_request_kind(&req) {
             tracing::error!("invalid AdmissionRequest: {}", err);
             return AdmissionResponse::invalid(format!("invalid AdmissionRequest: {}", err));
         }
 
         let rsp = AdmissionResponse::from(&req);
-        let (metadata, spec, id) = match parse_request(req) {
+        let (job_metadata, pod_template, id) = match parse_request(req)
+            .instrument(debug_span!("parse_admission_req"))
+            .await
+        {
             Ok(v) => v,
             Err(err) => {
                 tracing::error!("invalid AdmissionRequest: {}", err);
@@ -165,7 +168,11 @@ impl Handler {
             }
         };
 
-        let sweep_name = match get_container_name(metadata) {
+        let pod_metadata = pod_template.metadata.unwrap_or_default();
+        let sweep_name = match process_annotations(pod_metadata, job_metadata)
+            .instrument(debug_span!("process_annotations", job_id = &id))
+            .await
+        {
             Ok(v) => v,
             Err(err) => {
                 tracing::debug!("skipping mutation on Job [{}]: {}", &id, err);
@@ -173,11 +180,13 @@ impl Handler {
             }
         };
 
+        /*
         let patch = {
             let patches = create_patch().expect("failed to construct patches");
             tracing::info!(?patches, "patches");
             json_patch::Patch(patches)
         };
+        */
         rsp.with_patch(patch).expect("failed to patch")
     }
 }
@@ -195,27 +204,39 @@ fn check_request_kind(req: &AdmissionRequest<DynamicObject>) -> Result<()> {
     Ok(())
 }
 
-fn get_container_name(meta: ObjectMeta) -> Result<String> {
-    let annotations = meta
-        .annotations
-        .ok_or_else(|| anyhow!("ObjectMetadata is missing annotations"))?;
+// Inject annotation should be on Template Spec, not responsible for just one
+// thing but whatever, it's good for now.
+async fn process_annotations(pod_meta: ObjectMeta, job_meta: ObjectMeta) -> Result<String> {
+    trace!(%pod_meta, %job_meta, "metadata");
+    let pod_annotations = pod_meta.annotations.unwrap_or_else(|| {
+        debug!("PodTemplateSpec does not have any annotations");
+        Default::default
+    });
+
     // TODO: check spec not container for this annotation
-    let value = annotations
+    let value = pod_annotations
         .get("linkerd.io/inject")
         .map(|str| str.to_owned())
         .ok_or_else(|| anyhow!("Inject annotation is missing from ObjectMetadata"))?;
 
     if value != "enabled" {
-        return Err(anyhow!("linkerd injection is disabled"));
+        bail!("linkerd injection is disabled");
     }
 
+    let job_annotations = job_meta.annotations.unwrap_or_else(|| {
+        debug!("Job does not have any annotations");
+        Default::default
+    });
+
     let container_name = {
-        let name = annotations
+        let name = job_annotations
             .get("extensions.linkerd.io/sweep-container")
             .map(|str| str.to_owned())
             .ok_or_else(|| anyhow!("Sweep annotation is missing from ObjectMetadata"))?;
+
         if name.is_empty() {
-            return Err(anyhow!("no container has been named to be swept"));
+            debug!("sweep annotation present but value is missing");
+            bail!("no container nominated for sweeping");
         }
         name
     };
@@ -223,24 +244,27 @@ fn get_container_name(meta: ObjectMeta) -> Result<String> {
     Ok(container_name)
 }
 
-fn parse_request(req: AdmissionRequest<DynamicObject>) -> Result<(ObjectMeta, JobSpec, JobID)> {
+async fn parse_request(
+    req: AdmissionRequest<DynamicObject>,
+) -> Result<(ObjectMeta, PodTemplateSpec, JobID)> {
     let obj = req
         .object
         .ok_or_else(|| anyhow!("AdmissionRequest missing 'object' field"))?;
 
     let meta = obj.metadata;
-    let job_spec = {
+    let pod_spec = {
         let json_spec = obj
             .data
             .get("spec")
             .cloned()
             .ok_or_else(|| anyhow!("AdmissionRequest object missing 'spec' field"))?;
-        serde_json::from_value(json_spec)
-            .map_err(|err| anyhow!("Error deserializing object 'spec' to 'Job': {}", err))?
+        let job_spec = serde_json::from_value(json_spec)
+            .map_err(|err| anyhow!("Error deserializing object 'spec' to 'Job': {}", err))?;
+        job_spec.template
     };
 
     let id = JobID::try_from(&meta)?;
-    Ok((meta, job_spec, id))
+    Ok((meta, pod_spec, id))
 }
 
 struct JobID(String, String);
@@ -264,84 +288,5 @@ impl TryFrom<&ObjectMeta> for JobID {
             .as_ref()
             .ok_or_else(|| anyhow!("ObjectMetadata is missing its 'namespace' field"))?;
         Ok(JobID(ns.to_string(), name.to_string()))
-    }
-}
-
-fn create_patch_add(path: &str, value: serde_json::Value) -> json_patch::AddOperation {
-    json_patch::AddOperation {
-        path: path.into(),
-        value,
-    }
-}
-
-fn create_patch() -> Result<Vec<json_patch::PatchOperation>> {
-    let volume = {
-        let vol = create_volume();
-        serde_json::to_string(&vol)?
-    };
-
-    let init = {
-        let c = create_init_container();
-        serde_json::to_string(&c)?
-    };
-
-    let mount = {
-        let m = create_volume_mount();
-        serde_json::to_string(&m)?
-    };
-
-    Ok(vec![
-        json_patch::PatchOperation::Add(create_patch_add(
-            "/spec/template/spec/initContainers",
-            serde_json::json!({}),
-        )),
-        json_patch::PatchOperation::Add(create_patch_add(
-            "/spec/template/spec/volumes",
-            serde_json::json!({}),
-        )),
-        json_patch::PatchOperation::Add(create_patch_add(
-            "/spec/template/spec/volumes/-",
-            serde_json::json!(volume),
-        )),
-        json_patch::PatchOperation::Add(create_patch_add(
-            "/spec/template/spec/initContainers/-",
-            serde_json::json!(mount.clone()),
-        )),
-        //TODO: need to re-apply whole container object, can't just append
-        //volume at its path, cant idnex using jsonpatch
-        json_patch::PatchOperation::Add(create_patch_add(
-            "/spec/template/spec/containers/-",
-            serde_json::json!(mount),
-        )),
-    ])
-}
-
-fn create_volume() -> k8s_openapi::api::core::v1::Volume {
-    k8s_openapi::api::core::v1::Volume {
-        name: String::from("linkerd-await"),
-        empty_dir: Some(Default::default()),
-        ..Default::default()
-    }
-}
-
-fn create_init_container() -> k8s_openapi::api::core::v1::Container {
-    k8s_openapi::api::core::v1::Container {
-        name: String::from("linkerd-await"),
-        image: Some(String::from("docker.io/matei207/linkerd-await:v0.0.1")),
-        command: Some(vec![String::from("cp")]),
-        args: Some(vec![
-            String::from("/tmp/linkerd-await"),
-            String::from("/linkerd-await"),
-        ]),
-        volume_mounts: Some(vec![create_volume_mount()]),
-        ..Default::default()
-    }
-}
-
-fn create_volume_mount() -> k8s_openapi::api::core::v1::VolumeMount {
-    k8s_openapi::api::core::v1::VolumeMount {
-        mount_path: String::from("/linkerd"),
-        name: String::from("linkerd-await"),
-        ..Default::default()
     }
 }
