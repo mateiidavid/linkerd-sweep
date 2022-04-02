@@ -31,22 +31,48 @@ impl MakePatch {
         }
     }
 
-    fn add_init_container(self) -> Self {
+    pub fn add_await_volume(self) -> Self {
         let mut patches = self.patches;
-        let mut init_containers = self.template_spec.init_containers.unwrap_or(vec![]);
+        let vol_len = self
+            .template_spec
+            .volumes
+            .as_ref()
+            .unwrap_or(&Vec::new())
+            .len();
+        if vol_len == 0 {
+            patches.push(PatchOperation::Add(create_patch_add(
+                "/spec/template/spec/volumes",
+                serde_json::json!(Vec::<Volume>::new()),
+            )));
+        }
+        patches.push(json_patch::PatchOperation::Add(create_patch_add(
+            "/spec/template/spec/volumes/-",
+            serde_json::json!(self.volume.clone()),
+        )));
+        Self { patches, ..self }
+    }
+
+    pub fn add_init_container(self) -> Self {
+        let mut patches = self.patches;
+        let init_len = self
+            .template_spec
+            .init_containers
+            .as_ref()
+            .unwrap_or(&Vec::new())
+            .len();
         // Create patch with path if it doesn't exist
-        if init_containers.len() == 0 {
+        if init_len == 0 {
             patches.push(PatchOperation::Add(create_patch_add(
                 "/spec/template/spec/initContainers",
-                serde_json::json!({}),
+                serde_json::json!(Vec::<Container>::new()),
             )));
         }
 
         let init_container = {
             let mount = self.mount.clone();
-            k8s_openapi::api::core::v1::Container {
+            Container {
                 name: String::from("linkerd-await"),
-                image: Some(String::from("docker.io/matei207/linkerd-await:v0.0.1")),
+                image: Some(String::from("docker.io/matei207/init-await:v0.0.1")),
                 command: Some(vec![String::from("cp")]),
                 args: Some(vec![
                     String::from("/tmp/linkerd-await"),
@@ -56,10 +82,9 @@ impl MakePatch {
                 ..Default::default()
             }
         };
-        init_containers.push(init_container);
         patches.push(json_patch::PatchOperation::Add(create_patch_add(
             "/spec/template/spec/initContainers/-",
-            serde_json::json!(init_containers),
+            serde_json::json!(init_container),
         )));
 
         Self {
@@ -68,70 +93,53 @@ impl MakePatch {
             ..self
         }
     }
+
+    pub fn add_volume_to_container(self) -> anyhow::Result<Self> {
+        let mut patches = self.patches;
+        let container = {
+            let c = if let Some(v) =
+                find_container(&self.container_name, &self.template_spec.containers)
+            {
+                v
+            } else {
+                tracing::error!(container_name=%self.container_name, "container does not exist");
+                anyhow::bail!(
+                    "container {} does not exist in pod template spec",
+                    self.container_name
+                );
+            };
+            let mut mounts = c.volume_mounts.unwrap_or(vec![]);
+            mounts.push(self.mount.clone());
+            Container {
+                volume_mounts: Some(mounts),
+                ..c
+            }
+        };
+
+        patches.push(json_patch::PatchOperation::Add(create_patch_add(
+            "/spec/template/spec/containers/-",
+            serde_json::json!(container),
+        )));
+
+        Ok(Self { patches, ..self })
+    }
+
+    pub fn build_patch(self) -> json_patch::Patch {
+        tracing::debug!(?self.patches, "patches");
+        json_patch::Patch(self.patches)
+    }
+}
+
+fn find_container(name: &str, containers: &Vec<Container>) -> Option<Container> {
+    containers
+        .iter()
+        .find(|container| &container.name == name)
+        .map(|c| c.clone())
 }
 
 fn create_patch_add(path: &str, value: serde_json::Value) -> json_patch::AddOperation {
     json_patch::AddOperation {
         path: path.into(),
         value,
-    }
-}
-
-fn create_patch() -> anyhow::Result<Vec<json_patch::PatchOperation>> {
-    let volume = {
-        let vol = create_volume();
-        serde_json::to_string(&vol)?
-    };
-
-    let init = {
-        let c = create_init_container();
-        serde_json::to_string(&c)?
-    };
-
-    let mount = {
-        let m = create_volume_mount();
-        serde_json::to_string(&m)?
-    };
-
-    Ok(vec![
-        // Get all init containers, if path doesn't exist, then create it.
-        json_patch::PatchOperation::Add(create_patch_add(
-            "/spec/template/spec/initContainers",
-            serde_json::json!({}),
-        )),
-        json_patch::PatchOperation::Add(create_patch_add(
-            "/spec/template/spec/volumes",
-            serde_json::json!({}),
-        )),
-        json_patch::PatchOperation::Add(create_patch_add(
-            "/spec/template/spec/volumes/-",
-            serde_json::json!(volume),
-        )),
-        //TODO: need to re-apply whole container object, can't just append
-        //volume at its path, cant idnex using jsonpatch
-        json_patch::PatchOperation::Add(create_patch_add(
-            "/spec/template/spec/containers/-",
-            serde_json::json!(mount),
-        )),
-    ])
-}
-
-fn create_volume() -> k8s_openapi::api::core::v1::Volume {}
-
-fn create_init_container() -> k8s_openapi::api::core::v1::Container {}
-
-fn create_volume_mount() -> k8s_openapi::api::core::v1::VolumeMount {}
-
-fn add_volume(c: k8s_openapi::api::core::v1::Container) -> k8s_openapi::api::core::v1::Container {
-    let mut mounts = if let Some(v) = c.volume_mounts {
-        v
-    } else {
-        vec![]
-    };
-
-    mounts.push(create_volume_mount());
-    k8s_openapi::api::core::v1::Container {
-        volume_mounts: Some(mounts),
-        ..c
     }
 }

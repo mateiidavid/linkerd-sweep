@@ -1,5 +1,9 @@
 TODO:
 
+Try with process namespace
+
+---
+
 can't send shutdown requests from non-localhost addr
 
 Solution: use a volume and admission server.

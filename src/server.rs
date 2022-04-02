@@ -8,6 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures::{future, TryFutureExt};
 use hyper::{http, Body, Request};
 use hyper::{server::conn::Http, service::Service, Response};
+use k8s_openapi::api::batch::v1::JobSpec;
 use k8s_openapi::api::core::v1::PodTemplateSpec;
 use k8s_openapi::Resource;
 use kube::core::admission::{AdmissionRequest, AdmissionResponse};
@@ -171,7 +172,7 @@ impl Handler {
 
         let pod_metadata = pod_template.metadata.unwrap_or_default();
         let sweep_name = match process_annotations(pod_metadata, job_metadata)
-            .instrument(debug_span!("process_annotations", job_id = &id))
+            //.instrument(debug_span!("process_annotations", job_id = &id))
             .await
         {
             Ok(v) => v,
@@ -183,8 +184,14 @@ impl Handler {
 
         let patch = {
             let spec = pod_template.spec.unwrap();
-            let patcher = MakePatch::new(sweep_name, spec);
-        }
+            let patcher = MakePatch::new(sweep_name, spec)
+                .add_await_volume()
+                .add_init_container();
+            //.add_await_volume();
+            //.add_volume_to_container()
+            patcher.build_patch()
+        };
+        tracing::debug!(?patch, "patches");
         /*
         let patch = {
             let patches = create_patch().expect("failed to construct patches");
@@ -212,10 +219,10 @@ fn check_request_kind(req: &AdmissionRequest<DynamicObject>) -> Result<()> {
 // Inject annotation should be on Template Spec, not responsible for just one
 // thing but whatever, it's good for now.
 async fn process_annotations(pod_meta: ObjectMeta, job_meta: ObjectMeta) -> Result<String> {
-    trace!(%pod_meta, %job_meta, "metadata");
+    //trace!(%pod_meta, %job_meta, "metadata");
     let pod_annotations = pod_meta.annotations.unwrap_or_else(|| {
         debug!("PodTemplateSpec does not have any annotations");
-        Default::default
+        Default::default()
     });
 
     // TODO: check spec not container for this annotation
@@ -230,7 +237,7 @@ async fn process_annotations(pod_meta: ObjectMeta, job_meta: ObjectMeta) -> Resu
 
     let job_annotations = job_meta.annotations.unwrap_or_else(|| {
         debug!("Job does not have any annotations");
-        Default::default
+        Default::default()
     });
 
     let container_name = {
@@ -263,7 +270,7 @@ async fn parse_request(
             .get("spec")
             .cloned()
             .ok_or_else(|| anyhow!("AdmissionRequest object missing 'spec' field"))?;
-        let job_spec = serde_json::from_value(json_spec)
+        let job_spec: JobSpec = serde_json::from_value(json_spec)
             .map_err(|err| anyhow!("Error deserializing object 'spec' to 'Job': {}", err))?;
         job_spec.template
     };
