@@ -1,0 +1,13 @@
+[package]
+name = "proc-watcher"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1"
+procfs = "0.12"
+clap = { version = "3", default-features = false, features = ["derive", "env", "std"] }
+tracing = "0.1"
+tracing-subscriber = {version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "tracing-log", "smallvec"]}
