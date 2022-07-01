@@ -14,19 +14,13 @@ struct Args {
     #[clap(
         long,
         env = "LINKERD_SWEEP_LOG_LEVEL",
-        default_value = "linkerd_sweep=debug,kubert=info,warn"
+        default_value = "linkerd_sweep=info,warn"
     )]
     log_level: kubert::LogFilter,
 
     /// Log format (json | plain)
     #[clap(long, default_value = "plain")]
     log_format: kubert::LogFormat,
-
-    #[clap(flatten)]
-    client: kubert::ClientArgs,
-
-    #[clap(flatten)]
-    admin: kubert::AdminArgs,
 }
 
 #[tokio::main]
@@ -38,20 +32,9 @@ async fn main() -> Result<()> {
         admin,
     } = Args::parse();
 
-    let mut rt = kubert::Runtime::builder()
-        .with_log(log_level, log_format)
-        .with_admin(admin)
-        .with_client(client)
-        .build()
-        .await?;
-
+    log_format.try_init(log_level)?;
     let addr = SocketAddr::from(([0, 0, 0, 0], 443));
     let server = linkerd_sweep::server::AdmissionServer::new(addr);
     server.run().await;
     Ok(())
 }
-
-/* TODO:
- - get up and running with kube
- - watch pod resources... or jobs?
-*/
