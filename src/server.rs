@@ -14,11 +14,13 @@ use k8s_openapi::Resource;
 use kube::core::admission::{AdmissionRequest, AdmissionResponse};
 use kube::core::ObjectMeta;
 use kube::core::{admission::AdmissionReview, DynamicObject};
+use kubert::shutdown;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, debug_span, info_span, trace, Instrument};
 
 pub struct AdmissionServer {
     bind_addr: SocketAddr,
+    shutdown: shutdown::Watch,
     cert_path: PathBuf,
     key_path: PathBuf,
 }
@@ -27,21 +29,41 @@ const JOB_KIND: &'static str = k8s_openapi::api::batch::v1::Job::KIND;
 const JOB_GROUP: &'static str = k8s_openapi::api::batch::v1::Job::GROUP;
 
 impl AdmissionServer {
-    pub fn new(bind_addr: SocketAddr) -> Self {
-        Self {
+    pub fn new(bind_addr: SocketAddr, shutdown: shutdown::Watch) -> Self {
+        AdmissionServer {
             bind_addr,
+            shutdown,
             cert_path: PathBuf::from("/var/run/sweep/tls.crt"),
             key_path: PathBuf::from("/var/run/sweep/tls.key"),
         }
     }
 
-    pub async fn run(self) {
+    pub async fn run(self) -> Result<()> {
         tracing::info!("running, boss");
         let listener = TcpListener::bind(&self.bind_addr)
             .await
             .expect("listener should be created successfully");
-        let _local_addr = listener.local_addr().expect("can't get local addr");
 
+        let _local_addr = listener.local_addr().expect("can't get local addr");
+        let accept_task = tokio::spawn(AdmissionServer::accept(
+            listener,
+            self.cert_path.clone(),
+            self.key_path.clone(),
+        ));
+
+        tokio::select! {
+            _ = self.shutdown.signaled() => {
+                return Ok(());
+            }
+            _ = accept_task => {},
+        }
+
+        Ok(())
+    }
+
+    /// Accept loop. Figure out how to gracefully wait until all conns have
+    /// finished
+    async fn accept(listener: TcpListener, cert_path: PathBuf, key_path: PathBuf) {
         loop {
             tracing::info!("loopin, boss");
             let socket = match listener.accept().await {
@@ -61,7 +83,7 @@ impl AdmissionServer {
             };
 
             tokio::spawn(
-                Self::handle_conn(socket, self.cert_path.clone(), self.key_path.clone())
+                Self::handle_conn(socket, cert_path.clone(), key_path.clone())
                     .map_err(|err| tracing::error!(%err))
                     .instrument(info_span!("connection", peer.addr = %peer_addr)),
             );
