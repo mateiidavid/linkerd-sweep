@@ -1121,6 +1121,7 @@ dependencies = [
  "anyhow",
  "clap",
  "procfs",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
