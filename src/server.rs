@@ -8,15 +8,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures::{future, TryFutureExt};
 use hyper::{http, Body, Request};
 use hyper::{server::conn::Http, service::Service, Response};
-use k8s_openapi::api::batch::v1::JobSpec;
-use k8s_openapi::api::core::v1::PodTemplateSpec;
+use k8s_openapi::api::{batch::v1::JobSpec, core::v1::PodTemplateSpec};
 use k8s_openapi::Resource;
 use kube::core::admission::{AdmissionRequest, AdmissionResponse};
 use kube::core::ObjectMeta;
 use kube::core::{admission::AdmissionReview, DynamicObject};
 use kubert::shutdown;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, debug_span, info_span, trace, Instrument};
+use tracing::{debug, debug_span, error, info, info_span, Instrument};
 
 pub struct AdmissionServer {
     bind_addr: SocketAddr,
@@ -38,13 +37,12 @@ impl AdmissionServer {
         }
     }
 
+    #[tracing::instrument(level = "info", skip_all)]
     pub async fn run(self) -> Result<()> {
-        tracing::info!("running, boss");
         let listener = TcpListener::bind(&self.bind_addr)
             .await
-            .expect("listener should be created successfully");
+            .expect("Failed to bind listener");
 
-        let _local_addr = listener.local_addr().expect("can't get local addr");
         let accept_task = tokio::spawn(AdmissionServer::accept(
             listener,
             self.cert_path.clone(),
@@ -53,6 +51,7 @@ impl AdmissionServer {
 
         tokio::select! {
             _ = self.shutdown.signaled() => {
+                info!("Received shutdown signal");
                 return Ok(());
             }
             _ = accept_task => {},
@@ -63,13 +62,16 @@ impl AdmissionServer {
 
     /// Accept loop. Figure out how to gracefully wait until all conns have
     /// finished
+    #[tracing::instrument(level = "info", skip_all)]
     async fn accept(listener: TcpListener, cert_path: PathBuf, key_path: PathBuf) {
         loop {
-            tracing::info!("loopin, boss");
             let socket = match listener.accept().await {
-                Ok((socket, _)) => socket,
+                Ok((socket, addr)) => {
+                    info!(client.addr = %addr, "Accepted connection");
+                    socket
+                }
                 Err(err) => {
-                    tracing::error!(%err, "Failed to accept connection");
+                    error!(%err, "Failed to accept connection");
                     continue;
                 }
             };
@@ -77,7 +79,7 @@ impl AdmissionServer {
             let peer_addr = match socket.peer_addr() {
                 Ok(addr) => addr,
                 Err(err) => {
-                    tracing::error!(%err, "Failed to get peer addr");
+                    error!(%err, "Failed to get peer addr");
                     continue;
                 }
             };
@@ -91,7 +93,7 @@ impl AdmissionServer {
     }
 
     async fn handle_conn(socket: TcpStream, cert_path: PathBuf, key_path: PathBuf) -> Result<()> {
-        tracing::info!("buildin a conn");
+        info!("buildin a conn");
         // Build TLS Connector
         let tls = match tls::mk_tls_connector(&cert_path, &key_path).await {
             Ok(tls) => tls,
@@ -173,7 +175,7 @@ impl Handler {
 
     async fn process_request(self, req: AdmissionRequest<DynamicObject>) -> AdmissionResponse {
         if let Err(err) = check_request_kind(&req) {
-            tracing::error!("invalid AdmissionRequest: {}", err);
+            error!("invalid AdmissionRequest: {}", err);
             return AdmissionResponse::invalid(format!("invalid AdmissionRequest: {}", err));
         }
 
@@ -184,7 +186,7 @@ impl Handler {
         {
             Ok(v) => v,
             Err(err) => {
-                tracing::error!("invalid AdmissionRequest: {}", err);
+                error!("invalid AdmissionRequest: {}", err);
                 return AdmissionResponse::invalid(format!(
                     "Error parsing AdmissionRequest: {}",
                     err
@@ -199,7 +201,7 @@ impl Handler {
         {
             Ok(v) => v,
             Err(err) => {
-                tracing::debug!("skipping mutation on Job [{}]: {}", &id, err);
+                debug!("skipping mutation on Job [{}]: {}", &id, err);
                 return rsp;
             }
         };
@@ -213,7 +215,7 @@ impl Handler {
             //.add_volume_to_container()
             patcher.build_patch()
         };
-        tracing::debug!(?patch, "patches");
+        debug!(?patch, "patches");
         /*
         let patch = {
             let patches = create_patch().expect("failed to construct patches");

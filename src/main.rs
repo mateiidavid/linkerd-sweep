@@ -1,12 +1,8 @@
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 
-use crate::server::AdmissionServer;
 use anyhow::Result;
 use clap::Parser;
-use futures::lock::Mutex;
-use k8s_openapi::api::core::v1::Pod;
-use kube::api::ListParams;
-use tokio::sync::mpsc;
+use linkerd_sweep::server::AdmissionServer;
 use tracing::{debug, info};
 
 #[derive(Parser, Debug)]
@@ -34,7 +30,7 @@ async fn main() -> Result<()> {
 
     log_format.try_init(log_level)?;
 
-    let (shutdown_tx, shutdown_rx) = kubert::shutdown::sigint_or_sigterm()?;
+    let (_shutdown_tx, shutdown_rx) = kubert::shutdown::sigint_or_sigterm()?;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 443));
     let server = AdmissionServer::new(addr, shutdown_rx.clone());
@@ -45,9 +41,8 @@ async fn main() -> Result<()> {
             return Ok(());
         }
 
-        _ = server_task => {
-            let result = server_task.unwrap();
-            return result;
-        }
+        _ = server_task => {}
     }
+
+    Ok(())
 }
