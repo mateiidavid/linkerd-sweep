@@ -1,7 +1,7 @@
 
 use std::{net::SocketAddr, path::PathBuf};
 
-use crate::admission_handler::Handler;
+use crate::admission::Admission;
 use crate::tls;
 use anyhow::{bail, Context, Result};
 use hyper::server::conn::Http;
@@ -9,6 +9,7 @@ use kubert::shutdown;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug_span, error, info, Instrument};
 
+#[derive(Debug)]
 pub struct AdmissionServer {
     bind_addr: SocketAddr,
     shutdown: shutdown::Watch,
@@ -92,8 +93,8 @@ impl AdmissionServer {
         // Build TLS conn
         let stream = tls.accept(socket).await.with_context(|| "TLS Error")?;
         match Http::new()
-            .serve_connection(stream, Handler::new())
-            .instrument(debug_span!("admission.request", client.addr = %client_addr))
+            .serve_connection(stream, Admission::new())
+            .instrument(debug_span!("admission", client.addr = %client_addr))
             .await
         {
             Ok(_) => info!("Connection closed"),
