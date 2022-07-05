@@ -155,17 +155,6 @@ where
     T::DynamicType: Default,
 {
     let dt = Default::default();
-    // We construct a DynamicObject based on an ApiResource (which is a struct
-    // with type meta) => we can assume ours will be called with a type T, could
-    // be a Job, could be a CronJob, could be a Pod, or something different.
-    // Point is, it has a type meta and an ApiResource is constructed from it.
-    // When we get the group for a DynamicObject, the api group will be printed
-    // as a string, based on the api resource. group() is a trait method. What
-    // we're essentially doing here is comparing whatever our DynamicObject was
-    // deserialized from, with the default for a given type (in our case a Job).
-    // The type metas are very likely to be similar -- if Job implements
-    // Resource (and it would), and Default (it does, it's a trait bound), we
-    // can assume it'll have a default method.
     *req.kind.group == *T::group(&dt) && *req.kind.kind == *T::kind(&dt)
 }
 
