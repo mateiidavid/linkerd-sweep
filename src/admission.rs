@@ -5,15 +5,15 @@ use anyhow::{anyhow, bail, Result};
 use futures::future::BoxFuture;
 use hyper::body::Buf;
 use hyper::{http, service::Service, Body, Request, Response};
-use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::batch::v1beta1::CronJob;
-use k8s_openapi::api::{batch::v1::JobSpec, core::v1::PodTemplateSpec};
+use k8s_openapi::api::batch::v1::{Job, JobSpec};
+use k8s_openapi::api::core::v1::PodSpec;
 use k8s_openapi::Resource;
 use kube::core::ObjectMeta;
 use kube::{
     api::DynamicObject,
     core::admission::{AdmissionRequest, AdmissionResponse, AdmissionReview},
 };
+use serde::de::DeserializeOwned;
 use std::convert::{TryFrom, TryInto};
 use tracing::{debug, debug_span, error, trace, Instrument};
 
@@ -76,14 +76,48 @@ impl Admission {
         Admission
     }
 
+    // Admit resources:
+    // * Check if DynamicObject is Job. If it is, parse spec and then mutate
+    // * Else, resource is unsupported, so admit without mutating
+    // * (Low Priority) emit an event whenever an admission is skipped; include
+    //  err message
+    //  * (Low Priority) Log why admission has been skipped
     async fn admit(self, req: AdmissionRequest<DynamicObject>) -> AdmissionResponse {
         if is_kind::<Job>(&req) {
-            // deserialize
-            AdmissionResponse::from(&req)
-        } else if is_kind::<CronJob>(&req) {
-            //
-            AdmissionResponse::from(&req)
+            let resp = AdmissionResponse::from(&req);
+            let (job_meta, job_spec) = match parse_spec::<Job>(req) {
+                Ok(v) => v,
+                Err(error) => {
+                    debug!(%error, "Error parsing Job spec");
+                    return resp.deny(error);
+                }
+            };
+
+            let job_id = match JobID::try_from(&job_meta) {
+                Ok(id) => id,
+                Err(error) => {
+                    debug!(%error, "Failed to parse Job metadata");
+                    return resp.deny(error);
+                }
+            };
+
+            // Get pod spec, and pod meta
+            let (pod_meta, pod_spec) = match parse_template_spec(job_spec) {
+                Ok(v) => v,
+                Err(error) => {
+                    debug!(%error, "Error parsing PodTemplateSpec");
+                    return resp.deny(error);
+                }
+            };
+
+            // proccess annotations
+            // skip with reason or continue
+            // continue? return self.mutate
+            resp
         } else {
+            // Unsupported resource
+            // admit without mutating
+            // print gvk in debug
             AdmissionResponse::from(&req)
         }
     }
@@ -158,6 +192,45 @@ where
     *req.kind.group == *T::group(&dt) && *req.kind.kind == *T::kind(&dt)
 }
 
+// READ: https://serde.rs/lifetimes.html
+// and re-read through Serde docs
+// DeserializeOwned basically means T can be deserialized from any lifetime, the
+// assumption being that we do away with the DynamicObject after we're done.
+fn parse_spec<T>(req: AdmissionRequest<DynamicObject>) -> Result<(ObjectMeta, T)>
+where
+    T: DeserializeOwned,
+{
+    let obj = req
+        .object
+        .ok_or_else(|| anyhow!("AdmissionRequest missing 'object' field"))?;
+
+    let meta = obj.metadata;
+    let spec = {
+        let json_spec = obj
+            .data
+            .get("spec")
+            .cloned()
+            .ok_or_else(|| anyhow!("AdmissionRequest object missing 'spec' field"))?;
+        serde_json::from_value(json_spec)?
+    };
+
+    Ok((meta, spec))
+}
+
+fn parse_template_spec(spec: JobSpec) -> Result<(ObjectMeta, PodSpec)> {
+    let template_spec = spec.template;
+
+    let meta = template_spec
+        .metadata
+        .ok_or_else(|| anyhow!("JobSpec missing 'metadata' in PodTemplateSpec"))?;
+
+    let pod_spec = template_spec
+        .spec
+        .ok_or_else(|| anyhow!("JobSpec missing 'spec' in PodTemplateSpec"))?;
+
+    Ok((meta, pod_spec))
+}
+
 // Check if AdmissionRequest is for a Job
 fn is_valid_request(req: &AdmissionRequest<DynamicObject>) -> Result<()> {
     if req.kind.kind != JOB_KIND || req.kind.group != JOB_GROUP {
@@ -209,29 +282,6 @@ async fn process_annotations(pod_meta: ObjectMeta, job_meta: ObjectMeta) -> Resu
     };
 
     Ok(container_name)
-}
-
-async fn parse_request(
-    req: AdmissionRequest<DynamicObject>,
-) -> Result<(ObjectMeta, PodTemplateSpec, JobID)> {
-    let obj = req
-        .object
-        .ok_or_else(|| anyhow!("AdmissionRequest missing 'object' field"))?;
-
-    let meta = obj.metadata;
-    let pod_spec = {
-        let json_spec = obj
-            .data
-            .get("spec")
-            .cloned()
-            .ok_or_else(|| anyhow!("AdmissionRequest object missing 'spec' field"))?;
-        let job_spec: JobSpec = serde_json::from_value(json_spec)
-            .map_err(|err| anyhow!("Error deserializing object 'spec' to 'Job': {}", err))?;
-        job_spec.template
-    };
-
-    let id = JobID::try_from(&meta)?;
-    Ok((meta, pod_spec, id))
 }
 
 struct JobID(String, String);
