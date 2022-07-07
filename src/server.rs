@@ -84,9 +84,9 @@ impl AdmissionServer {
         // Build TLS Connector
         let tls = match tls::mk_tls_connector(&cert_path, &key_path).await {
             Ok(tls) => tls,
-            Err(err) => {
-                error!(%err, "Failed to establish TLS connection");
-                bail!("Failed to establish TLS connection: {}", err);
+            Err(error) => {
+                error!(%error, "Failed to establish TLS connection");
+                bail!("Failed to establish TLS connection: {}", error);
             }
         };
 

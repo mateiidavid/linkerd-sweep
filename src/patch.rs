@@ -1,5 +1,6 @@
 use json_patch::PatchOperation;
 use k8s_openapi::api::core::v1::{Container, PodSpec, Volume, VolumeMount};
+use serde::Serialize;
 
 #[derive(Clone, Debug, Default)]
 pub struct MakePatch {
@@ -9,6 +10,47 @@ pub struct MakePatch {
     init_container: Container,
     mount: VolumeMount,
     patches: Vec<PatchOperation>,
+}
+
+#[async_trait::async_trait]
+trait MakePatcher<T>
+where
+    T: Serialize,
+{
+    type Patcher: Patcher;
+    async fn make_patcher(self, spec: T, comm: String) -> Self::Patcher;
+}
+
+#[async_trait::async_trait]
+trait Patcher {
+    async fn patch(self) -> anyhow::Result<json_patch::Patch>;
+}
+
+pub struct MakeAwaitPodPatcher;
+#[async_trait::async_trait]
+impl MakePatcher<PodSpec> for MakeAwaitPodPatcher {
+    type Patcher = PodPatcher;
+    async fn make_patcher(self, spec: PodSpec, comm: String) -> PodPatcher {
+        PodPatcher {
+            spec,
+            comm,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PodPatcher {
+    spec: PodSpec,
+    comm: String,
+    ops: Vec<PatchOperation>,
+}
+
+#[async_trait::async_trait]
+impl Patcher for PodPatcher {
+    async fn patch(self) -> anyhow::Result<json_patch::Patch> {
+        todo!();
+    }
 }
 
 impl MakePatch {

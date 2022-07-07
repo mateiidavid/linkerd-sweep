@@ -1,6 +1,5 @@
 use core::task;
 
-use crate::patch::MakePatch;
 use anyhow::{anyhow, bail, Result};
 use futures::future::BoxFuture;
 use hyper::body::Buf;
@@ -14,11 +13,9 @@ use kube::{
     core::admission::{AdmissionRequest, AdmissionResponse, AdmissionReview},
 };
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::convert::{TryFrom, TryInto};
-use tracing::{debug, debug_span, error, trace, Instrument};
-
-const JOB_KIND: &'static str = k8s_openapi::api::batch::v1::Job::KIND;
-const JOB_GROUP: &'static str = k8s_openapi::api::batch::v1::Job::GROUP;
+use tracing::{debug, debug_span, trace, Instrument};
 
 #[derive(Clone)]
 pub struct Admission;
@@ -85,7 +82,7 @@ impl Admission {
     async fn admit(self, req: AdmissionRequest<DynamicObject>) -> AdmissionResponse {
         if is_kind::<Job>(&req) {
             let resp = AdmissionResponse::from(&req);
-            let (job_meta, job_spec) = match parse_spec::<Job>(req) {
+            let (job_meta, job_spec) = match parse_spec::<JobSpec>(req) {
                 Ok(v) => v,
                 Err(error) => {
                     debug!(%error, "Error parsing Job spec");
@@ -101,6 +98,14 @@ impl Admission {
                 }
             };
 
+            let comm = match extract_annotation(job_meta, "extensions.linkerd.io/sweep-comm") {
+                Ok(comm) => comm,
+                Err(error) => {
+                    debug!(%job_id, %error, "Failed to extract annotation from Job metadata");
+                    return resp;
+                }
+            };
+
             // Get pod spec, and pod meta
             let (pod_meta, pod_spec) = match parse_template_spec(job_spec) {
                 Ok(v) => v,
@@ -110,10 +115,38 @@ impl Admission {
                 }
             };
 
+            let injectable = match extract_annotation(pod_meta, "linkerd.io/inject") {
+                Ok(inj) => inj == "enabled",
+                Err(error) => {
+                    debug!(%job_id, %error, "Failed to extract annotation from Pod metadata");
+                    return resp;
+                }
+            };
+
+            if !injectable {
+                debug!(%job_id, "Skipping mutation; pod is not injected with linkerd-proxy");
+                return resp;
+            }
+
+            self.mutate::<PodSpec>(pod_spec, comm)
+                .instrument(debug_span!("admission.mutate", %job_id))
+                .await
+
+            /*
+                 *
+            let patch = {
+                let spec = pod_template.spec.unwrap();
+                let patcher = MakePatch::new(sweep_name, spec)
+                    .add_await_volume()
+                    .add_init_container();
+                //.add_await_volume();
+                //.add_volume_to_container()
+                patcher.build_patch()
+            };
+            */
             // proccess annotations
             // skip with reason or continue
             // continue? return self.mutate
-            resp
         } else {
             // Unsupported resource
             // admit without mutating
@@ -122,64 +155,8 @@ impl Admission {
         }
     }
 
-    // TODO: delete lol
-    async fn process_request(self, req: AdmissionRequest<DynamicObject>) -> AdmissionResponse {
-        // TODO: this is not correct:
-        //  * Invalid jobs should be admitted without a patch (look at Linkerd
-        //  injector for ideas) (high priority)
-        //  * We should emit an event whenever an admission is skipped; include
-        //  the error message (low priority)
-        //  * We should log why the admission has been skipped.
-        if let Err(err) = is_valid_request(&req) {
-            error!("Invalid AdmissionRequest: {}", err);
-            return AdmissionResponse::invalid(format!("invalid AdmissionRequest: {}", err));
-        }
-
-        let rsp = AdmissionResponse::from(&req);
-        let (job_metadata, pod_template, id) = match parse_request(req)
-            .instrument(debug_span!("parse_admission_req"))
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                error!("invalid AdmissionRequest: {}", err);
-                return AdmissionResponse::invalid(format!(
-                    "Error parsing AdmissionRequest: {}",
-                    err
-                ));
-            }
-        };
-
-        let pod_metadata = pod_template.metadata.unwrap_or_default();
-        let sweep_name = match process_annotations(pod_metadata, job_metadata)
-            //.instrument(debug_span!("process_annotations", job_id = &id))
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                debug!("skipping mutation on Job [{}]: {}", &id, err);
-                return rsp;
-            }
-        };
-
-        let patch = {
-            let spec = pod_template.spec.unwrap();
-            let patcher = MakePatch::new(sweep_name, spec)
-                .add_await_volume()
-                .add_init_container();
-            //.add_await_volume();
-            //.add_volume_to_container()
-            patcher.build_patch()
-        };
-        trace!(?patch);
-        /*
-        let patch = {
-            let patches = create_patch().expect("failed to construct patches");
-            tracing::info!(?patches, "patches");
-            json_patch::Patch(patches)
-        };
-        */
-        rsp.with_patch(patch).expect("Failed to patch")
+    async fn mutate<T: Serialize>(self, spec: T, comm: String) -> AdmissionResponse {
+        todo!();
     }
 }
 
@@ -231,57 +208,26 @@ fn parse_template_spec(spec: JobSpec) -> Result<(ObjectMeta, PodSpec)> {
     Ok((meta, pod_spec))
 }
 
-// Check if AdmissionRequest is for a Job
-fn is_valid_request(req: &AdmissionRequest<DynamicObject>) -> Result<()> {
-    if req.kind.kind != JOB_KIND || req.kind.group != JOB_GROUP {
-        return Err(anyhow!(
-            "AdmissionRequest group or kind is invalid: {:?}.{:?}",
-            req.kind.group,
-            req.kind.kind
-        ));
-    }
-
-    Ok(())
-}
-
-// Inject annotation should be on Template Spec, not responsible for just one
-// thing but whatever, it's good for now.
-async fn process_annotations(pod_meta: ObjectMeta, job_meta: ObjectMeta) -> Result<String> {
-    //trace!(%pod_meta, %job_meta, "metadata");
-    let pod_annotations = pod_meta.annotations.unwrap_or_else(|| {
-        debug!("PodTemplateSpec does not have any annotations");
-        Default::default()
-    });
-
-    // TODO: check spec not container for this annotation
-    let value = pod_annotations
-        .get("linkerd.io/inject")
-        .map(|str| str.to_owned())
-        .ok_or_else(|| anyhow!("Inject annotation is missing from ObjectMetadata"))?;
-
-    if value != "enabled" {
-        bail!("linkerd injection is disabled");
-    }
-
-    let job_annotations = job_meta.annotations.unwrap_or_else(|| {
-        debug!("Job does not have any annotations");
-        Default::default()
-    });
-
-    let container_name = {
-        let name = job_annotations
-            .get("extensions.linkerd.io/sweep-container")
-            .map(|str| str.to_owned())
-            .ok_or_else(|| anyhow!("Sweep annotation is missing from ObjectMetadata"))?;
-
-        if name.is_empty() {
-            debug!("sweep annotation present but value is missing");
-            bail!("no container nominated for sweeping");
-        }
-        name
+fn extract_annotation(meta: ObjectMeta, key: &str) -> Result<String> {
+    let annotations = if let Some(annotations) = meta.annotations {
+        annotations
+    } else {
+        bail!("ObjectMetadata does not contain any annotations");
     };
 
-    Ok(container_name)
+    let value = annotations
+        .get(key)
+        .map(|str| str.to_owned())
+        .ok_or_else(|| anyhow!("Annotation '{}' is missing from ObjectMetadata", key));
+    match value {
+        Ok(v) => {
+            if v.is_empty() {
+                bail!("Annotation '{}' does not contain a value", key);
+            }
+            return Ok(v);
+        }
+        Err(error) => bail!(error),
+    }
 }
 
 struct JobID(String, String);
