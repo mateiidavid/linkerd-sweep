@@ -5,8 +5,7 @@ use futures::future::BoxFuture;
 use hyper::body::Buf;
 use hyper::{http, service::Service, Body, Request, Response};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
-use k8s_openapi::api::core::v1::PodSpec;
-use k8s_openapi::Resource;
+use k8s_openapi::api::core::v1::{Pod, PodSpec};
 use kube::core::ObjectMeta;
 use kube::{
     api::DynamicObject,
@@ -42,6 +41,7 @@ impl Service<Request<Body>> for Admission {
         // TODO: check methods
         let handler = self.clone();
         Box::pin(async {
+            // Turn request body into an AdmissionReview
             let review: AdmissionReview<DynamicObject> = {
                 let body = hyper::body::aggregate(req.into_body()).await?;
                 serde_json::from_reader(body.reader())?
@@ -79,18 +79,20 @@ impl Admission {
     // * (Low Priority) emit an event whenever an admission is skipped; include
     //  err message
     //  * (Low Priority) Log why admission has been skipped
+    //  * Update: check if DynamicObject is Pod. If it is, parse spec, and then
+    //  mutate
     async fn admit(self, req: AdmissionRequest<DynamicObject>) -> AdmissionResponse {
-        if is_kind::<Job>(&req) {
+        if is_kind::<Pod>(&req) {
             let resp = AdmissionResponse::from(&req);
-            let (job_meta, job_spec) = match parse_spec::<JobSpec>(req) {
+            let (pod_meta, pod_spec) = match parse_spec::<PodSpec>(req) {
                 Ok(v) => v,
                 Err(error) => {
-                    debug!(%error, "Error parsing Job spec");
+                    debug!(%error, "Error parsing Pod spec");
                     return resp.deny(error);
                 }
             };
 
-            let job_id = match JobID::try_from(&job_meta) {
+            let pod_id = match PodID::try_from(&pod_meta) {
                 Ok(id) => id,
                 Err(error) => {
                     debug!(%error, "Failed to parse Job metadata");
@@ -98,38 +100,30 @@ impl Admission {
                 }
             };
 
-            let comm = match extract_annotation(job_meta, "extensions.linkerd.io/sweep-comm") {
-                Ok(comm) => comm,
-                Err(error) => {
-                    debug!(%job_id, %error, "Failed to extract annotation from Job metadata");
-                    return resp;
-                }
-            };
-
-            // Get pod spec, and pod meta
-            let (pod_meta, pod_spec) = match parse_template_spec(job_spec) {
-                Ok(v) => v,
-                Err(error) => {
-                    debug!(%error, "Error parsing PodTemplateSpec");
-                    return resp.deny(error);
-                }
-            };
-
-            let injectable = match extract_annotation(pod_meta, "linkerd.io/inject") {
-                Ok(inj) => inj == "enabled",
-                Err(error) => {
-                    debug!(%job_id, %error, "Failed to extract annotation from Pod metadata");
-                    return resp;
-                }
-            };
-
-            if !injectable {
-                debug!(%job_id, "Skipping mutation; pod is not injected with linkerd-proxy");
+            let pod_labels = if let Some(labels) = pod_meta.labels {
+                labels
+            } else {
+                debug!("Pod does not contain any labels");
                 return resp;
+            };
+
+            if !pod_labels.contains_key("extensions.linkerd.io/sweep-sidecar") {
+                debug!(%pod_id, "Pod is missing 'sweep-sidecar' label");
+                return resp;
+            } else {
+                let enabled = match pod_labels.get("extensions.linkerd.io/sweep-sidecar") {
+                    Some(lv) => lv == "enabled",
+                    None => false,
+                };
+
+                if !enabled {
+                    debug!(%pod_id, "Skipping pod, 'linkerd-sweep' is not enabled");
+                    return resp;
+                }
             }
 
-            self.mutate::<PodSpec>(pod_spec, comm)
-                .instrument(debug_span!("admission.mutate", %job_id))
+            self.mutate::<PodSpec>(pod_spec)
+                .instrument(debug_span!("admission.mutate", %pod_id))
                 .await
 
             /*
@@ -155,7 +149,7 @@ impl Admission {
         }
     }
 
-    async fn mutate<T: Serialize>(self, spec: T, comm: String) -> AdmissionResponse {
+    async fn mutate<T: Serialize>(self, spec: T) -> AdmissionResponse {
         todo!();
     }
 }
@@ -230,15 +224,15 @@ fn extract_annotation(meta: ObjectMeta, key: &str) -> Result<String> {
     }
 }
 
-struct JobID(String, String);
+struct PodID(String, String);
 
-impl std::fmt::Display for JobID {
+impl std::fmt::Display for PodID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.0, self.1)
     }
 }
 
-impl TryFrom<&ObjectMeta> for JobID {
+impl TryFrom<&ObjectMeta> for PodID {
     type Error = anyhow::Error;
 
     fn try_from(value: &ObjectMeta) -> Result<Self, Self::Error> {
@@ -250,6 +244,6 @@ impl TryFrom<&ObjectMeta> for JobID {
             .namespace
             .as_ref()
             .ok_or_else(|| anyhow!("ObjectMetadata is missing its 'namespace' field"))?;
-        Ok(JobID(ns.to_string(), name.to_string()))
+        Ok(PodID(ns.to_string(), name.to_string()))
     }
 }
