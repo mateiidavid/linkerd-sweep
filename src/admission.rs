@@ -184,12 +184,12 @@ impl JsonPatch for PodSpec {
         let mut patches: Vec<PatchOperation> = vec![];
 
         if self.init_containers.is_none() {
-            patches.push(mk_root_patch("/spec/initContainers"));
+            patches.push(mk_add_patch("/spec/initContainers", {}));
         }
-        patches.push(mk_init_patch());
+        patches.push(mk_add_patch("/spec/initContainers/-", create_await_container()));
 
         if self.volumes.is_none() {
-            patches.push(mk_root_patch("/spec/volumes"));
+            patches.push(mk_add_patch("/spec/volumes", {}));
         }
 
         patches.push(mk_volume_patch())
@@ -341,18 +341,17 @@ fn check_container_comm(c: &k8s_openapi::api::core::v1::Container) -> Result<Vec
     Ok(new_args)
 }
 
+fn mk_add_patch<T: Serialize>(path: &str, value: T) -> json_patch::PatchOperation {
+    json_patch::PatchOperation::Add(json_patch::AddOperation {
+        path: path.into(),
+        value: serde_json::json!(value),
+    })
+}
+
 fn mk_root_patch(path: &str) -> json_patch::PatchOperation {
     json_patch::PatchOperation::Add(json_patch::AddOperation {
         path: path.into(),
         value: serde_json::json!({}),
-    })
-}
-
-fn mk_init_patch() -> json_patch::PatchOperation {
-    let await_container = create_await_container();
-    json_patch::PatchOperation::Add(json_patch::AddOperation {
-        path: "/spec/initContainers/-".to_owned(),
-        value: serde_json::json!(await_container),
     })
 }
 
