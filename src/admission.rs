@@ -186,47 +186,46 @@ impl JsonPatch for PodSpec {
         if self.init_containers.is_none() {
             patches.push(mk_add_patch("/spec/initContainers", {}));
         }
-        patches.push(mk_add_patch("/spec/initContainers/-", create_await_container()));
+        patches.push(mk_add_patch(
+            "/spec/initContainers/-",
+            k8s_openapi::api::core::v1::Container {
+                name: "await-init".to_owned(),
+                image: Some("foo.io/bar:v0.0.0".to_owned()),
+                image_pull_policy: Some("IfNotPresent".to_owned()),
+                volume_mounts: Some(vec![create_volume_mount(false)]),
+                ..Default::default()
+            },
+        ));
 
         if self.volumes.is_none() {
             patches.push(mk_add_patch("/spec/volumes", {}));
         }
 
-        patches.push(mk_volume_patch())
+        patches.push(mk_add_patch(
+            "/spec/volumes/-",
+            k8s_openapi::api::core::v1::Volume {
+                name: "linkerd-await".into(),
+                empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource::default()),
+                ..Default::default()
+            },
+        ));
 
-        for (i, container) in self.containers.iter().enumerate() {
+        for (i, container) in self.containers.into_iter().enumerate() {
+            let name = container.name.clone();
             // skip if proxy
-            if container.name == "linkerd-proxy" {
+            if name == "linkerd-proxy" {
                 continue;
             }
 
-            if let Ok(args) = check_container_comm(container) {
-                // TODO: might wanna get rid of this
-                let path = format!("{}/{}", "/spec/containers/", i);
-
-                if container.volume_mounts.is_none() {
-                    patches.push(PatchOperation::Add(json_patch::AddOperation {
-                        path: path.clone() + "/volumeMounts/",
-                        value: serde_json::json!(
-                            Vec::<k8s_openapi::api::core::v1::VolumeMount>::new()
-                        ),
-                    }));
+            let current_path = format!("{}/{}", "/spec/containers/", i);
+            match create_container_patches(&current_path, container) {
+                Ok(mut container_patches) => {
+                    patches.append(&mut container_patches);
+                    debug!(container_name=%name, "Patched container");
                 }
-
-                patches.push(PatchOperation::Add(json_patch::AddOperation {
-                    path: path.clone() + "/volumeMounts/-",
-                    value: serde_json::json!(gen_volume_mount(true)),
-                }));
-
-                patches.push(PatchOperation::Replace(json_patch::ReplaceOperation {
-                    path: path.clone() + "/command",
-                    value: serde_json::json!(vec!["/linkerd/linkerd-await --shutdown"]),
-                }));
-
-                patches.push(PatchOperation::Replace(json_patch::ReplaceOperation {
-                    path: path + "/args",
-                    value: serde_json::json!(args),
-                }))
+                Err(err) => {
+                    debug!(container_name=%name, %err, "Skipped patch");
+                }
             }
         }
 
@@ -234,6 +233,48 @@ impl JsonPatch for PodSpec {
         Ok(json_patch::Patch(patches))
     }
 }
+
+fn create_container_patches(
+    root_path: &str,
+    c: k8s_openapi::api::core::v1::Container,
+) -> Result<Vec<json_patch::PatchOperation>> {
+    let comm = c
+        .command
+        .as_ref()
+        .ok_or_else(|| anyhow!("container {} is missing 'command' field", c.name))?;
+
+    let mut new_args = vec!["---".to_owned()];
+    for command in comm.clone().into_iter() {
+        new_args.push(command);
+    }
+
+    if let Some(args) = c.args {
+        for arg in args.into_iter() {
+            new_args.push(arg);
+        }
+    }
+
+    let mut patches = Vec::new();
+    let comm_path = format!("/{}/command", root_path);
+    patches.push(mk_replace_patch(
+        comm_path,
+        vec!["/linkerd/linkerd-await --shutdown"],
+    ));
+
+    let arg_path = format!("/{}/args", root_path);
+    patches.push(mk_replace_patch(arg_path, new_args));
+
+    if c.volume_mounts.is_none() {
+        let volume_mount_path = format!("/{}/volumeMounts", root_path);
+        patches.push(mk_root_patch(volume_mount_path));
+    }
+
+    let volume_path = format!("/{}/volumeMounts/-", root_path);
+    patches.push(mk_add_patch(volume_path, create_volume_mount(true)));
+
+    Ok(patches)
+}
+
 // READ: https://serde.rs/lifetimes.html
 // and re-read through Serde docs
 // DeserializeOwned basically means T can be deserialized from any lifetime, the
@@ -324,31 +365,24 @@ impl TryFrom<&ObjectMeta> for PodID {
 //////  Playing around
 ///
 
-fn check_container_comm(c: &k8s_openapi::api::core::v1::Container) -> Result<Vec<String>> {
-    let comm = c
-        .command
-        .as_ref()
-        .ok_or_else(|| anyhow!("missing 'command' field"))?;
-
-    let mut new_args = vec!["---".to_owned()];
-    // TODO: yuuuck!
-    new_args.append(&mut comm.clone());
-    // TODO: yuck!
-    if let Some(args) = &c.args {
-        new_args.append(&mut args.clone());
-    };
-
-    Ok(new_args)
-}
-
-fn mk_add_patch<T: Serialize>(path: &str, value: T) -> json_patch::PatchOperation {
+fn mk_add_patch<T: Serialize, S: Into<String>>(path: S, value: T) -> json_patch::PatchOperation {
     json_patch::PatchOperation::Add(json_patch::AddOperation {
         path: path.into(),
         value: serde_json::json!(value),
     })
 }
 
-fn mk_root_patch(path: &str) -> json_patch::PatchOperation {
+fn mk_replace_patch<T: Serialize, S: Into<String>>(
+    path: S,
+    value: T,
+) -> json_patch::PatchOperation {
+    json_patch::PatchOperation::Replace(json_patch::ReplaceOperation {
+        path: path.into(),
+        value: serde_json::json!(value),
+    })
+}
+
+fn mk_root_patch<S: Into<String>>(path: S) -> json_patch::PatchOperation {
     json_patch::PatchOperation::Add(json_patch::AddOperation {
         path: path.into(),
         value: serde_json::json!({}),
@@ -360,15 +394,15 @@ fn create_await_container() -> k8s_openapi::api::core::v1::Container {
         name: "await-init".to_owned(),
         image: Some("foo.io/bar:v0.0.0".to_owned()),
         image_pull_policy: Some("IfNotPresent".to_owned()),
-        volume_mounts: Some(vec![gen_volume_mount(false)]),
+        volume_mounts: Some(vec![create_volume_mount(false)]),
         ..Default::default()
     }
 }
 
-fn gen_volume_mount(read_only: bool) -> k8s_openapi::api::core::v1::VolumeMount {
+fn create_volume_mount(read_only: bool) -> k8s_openapi::api::core::v1::VolumeMount {
     k8s_openapi::api::core::v1::VolumeMount {
         mount_path: "/linkerd".to_owned(),
-        name: "sweep-util".to_owned(),
+        name: "linkerd-await".to_owned(),
         read_only: Some(read_only),
         ..Default::default()
     }
