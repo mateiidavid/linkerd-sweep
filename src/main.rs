@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use anyhow::Result;
 use clap::Parser;
 use linkerd_sweep::server::AdmissionServer;
-use tracing::{debug, info};
+use tracing::info;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]

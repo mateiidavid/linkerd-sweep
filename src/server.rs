@@ -58,7 +58,7 @@ impl AdmissionServer {
         loop {
             let (socket, peer_addr) = match listener.accept().await {
                 Ok((socket, addr)) => {
-                    info!(client.addr = %addr, "Connection established");
+                    info!("Connection established");
                     (socket, addr)
                 }
                 Err(err) => {
@@ -94,7 +94,7 @@ impl AdmissionServer {
         let stream = tls.accept(socket).await.with_context(|| "TLS Error")?;
         match Http::new()
             .serve_connection(stream, Admission::new())
-            .instrument(debug_span!("admission", client.addr = %client_addr))
+            .instrument(debug_span!("admission"))
             .await
         {
             Ok(_) => info!("Connection closed"),
