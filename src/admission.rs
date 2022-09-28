@@ -188,13 +188,7 @@ impl JsonPatch for PodSpec {
         }
         patches.push(mk_add_patch(
             "/spec/initContainers/-",
-            k8s_openapi::api::core::v1::Container {
-                name: "await-init".to_owned(),
-                image: Some("foo.io/bar:v0.0.0".to_owned()),
-                image_pull_policy: Some("IfNotPresent".to_owned()),
-                volume_mounts: Some(vec![create_volume_mount(false)]),
-                ..Default::default()
-            },
+            create_curl_container(),
         ));
 
         if self.volumes.is_none() {
@@ -389,21 +383,30 @@ fn mk_root_patch<S: Into<String>>(path: S) -> json_patch::PatchOperation {
     })
 }
 
-fn create_await_container() -> k8s_openapi::api::core::v1::Container {
-    k8s_openapi::api::core::v1::Container {
-        name: "await-init".to_owned(),
-        image: Some("foo.io/bar:v0.0.0".to_owned()),
-        image_pull_policy: Some("IfNotPresent".to_owned()),
-        volume_mounts: Some(vec![create_volume_mount(false)]),
-        ..Default::default()
-    }
-}
-
 fn create_volume_mount(read_only: bool) -> k8s_openapi::api::core::v1::VolumeMount {
     k8s_openapi::api::core::v1::VolumeMount {
         mount_path: "/linkerd".to_owned(),
         name: "linkerd-await".to_owned(),
         read_only: Some(read_only),
+        ..Default::default()
+    }
+}
+
+fn create_curl_container() -> k8s_openapi::api::core::v1::Container {
+    let mut args = vec!["-c".into()];
+    let await_url = String::from("https://github.com/linkerd/linkerd-await/releases/download/release%2Fv0.2.7/linkerd-await-v0.2.7-amd64");
+    let curl_command = format!(
+        "curl -sSLo {} {};chmod 755 /linkerd/linkerd-await",
+        "/linkerd/linkerd-await", await_url
+    );
+    args.push(curl_command);
+    k8s_openapi::api::core::v1::Container {
+        name: "await-init".to_owned(),
+        image: Some("ghcr.io/mateiidavid/linkerd-sweep:test".to_owned()),
+        image_pull_policy: Some("IfNotPresent".to_owned()),
+        volume_mounts: Some(vec![create_volume_mount(false)]),
+        command: Some(vec!["/bin/sh".into()]),
+        args: Some(args),
         ..Default::default()
     }
 }
