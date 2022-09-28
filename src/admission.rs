@@ -5,7 +5,7 @@ use futures::future::BoxFuture;
 use hyper::body::Buf;
 use hyper::{http, service::Service, Body, Request, Response};
 use json_patch::PatchOperation;
-use k8s_openapi::api::batch::v1::{Job, JobSpec};
+use k8s_openapi::api::batch::v1::JobSpec;
 use k8s_openapi::api::core::v1::{Pod, PodSpec};
 use kube::core::ObjectMeta;
 use kube::{
@@ -53,17 +53,13 @@ impl Service<Request<Body>> for Admission {
                 Ok(req) => handler.admit(req).await.into_review(),
                 Err(err) => bail!("AdmissionRequest is invalid: {}", err),
             };
-            //  * quick validation: does main container match a container in the
-            //  template spec? if not err out
-            // JSONPATCH: add emptydir volume with init container for linkerd-await command: curl
-            // binary or smth
-            // JSONPATCH: add entrypoint to main container
 
-            let bytes = serde_json::to_vec(&rsp)?;
+            tracing::info!(?rsp);
+            let b = serde_json::to_string(&rsp)?;
             Ok(Response::builder()
                 .status(http::StatusCode::OK)
                 .header(http::header::CONTENT_TYPE, "application/json")
-                .body(hyper::Body::from(bytes))
+                .body(hyper::Body::from(b))
                 .unwrap())
         })
     }
@@ -96,8 +92,10 @@ impl Admission {
             let pod_id = match PodID::try_from(&pod_meta) {
                 Ok(id) => id,
                 Err(error) => {
-                    debug!(%error, "Failed to parse Job metadata");
-                    return resp.deny(error);
+                    debug!(%error, "Failed to parse Pod metadata");
+                    // TODO: pods won't have names yet unfortunately
+                    PodID("banana".into(), "banana-namespace".into())
+                    //return resp.deny(error);
                 }
             };
 
@@ -126,23 +124,8 @@ impl Admission {
             self.mutate::<PodSpec>(resp, pod_spec)
                 .instrument(debug_span!("admission.mutate", %pod_id))
                 .await
-
-            /*
-                 *
-            let patch = {
-                let spec = pod_template.spec.unwrap();
-                let patcher = MakePatch::new(sweep_name, spec)
-                    .add_await_volume()
-                    .add_init_container();
-                //.add_await_volume();
-                //.add_volume_to_container()
-                patcher.build_patch()
-            };
-            */
-            // proccess annotations
-            // skip with reason or continue
-            // continue? return self.mutate
         } else {
+            debug!("Not pod kind");
             // Unsupported resource
             // admit without mutating
             // print gvk in debug
@@ -158,6 +141,7 @@ impl Admission {
             Ok(patch) => resp
                 .with_patch(patch)
                 .expect("Failed to patch AdmissionResponse"),
+
             Err(err) => {
                 debug!(%err, "Failed to generate patch");
                 resp
@@ -211,7 +195,7 @@ impl JsonPatch for PodSpec {
                 continue;
             }
 
-            let current_path = format!("{}/{}", "/spec/containers/", i);
+            let current_path = format!("{}/{}", "/spec/containers", i);
             match create_container_patches(&current_path, container) {
                 Ok(mut container_patches) => {
                     patches.append(&mut container_patches);
@@ -237,7 +221,7 @@ fn create_container_patches(
         .as_ref()
         .ok_or_else(|| anyhow!("container {} is missing 'command' field", c.name))?;
 
-    let mut new_args = vec!["---".to_owned()];
+    let mut new_args = vec!["--shutdown".into(), "--".into()];
     for command in comm.clone().into_iter() {
         new_args.push(command);
     }
@@ -249,21 +233,18 @@ fn create_container_patches(
     }
 
     let mut patches = Vec::new();
-    let comm_path = format!("/{}/command", root_path);
-    patches.push(mk_replace_patch(
-        comm_path,
-        vec!["/linkerd/linkerd-await --shutdown"],
-    ));
+    let comm_path = format!("{}/command", root_path);
+    patches.push(mk_replace_patch(comm_path, vec!["/linkerd/linkerd-await"]));
 
-    let arg_path = format!("/{}/args", root_path);
+    let arg_path = format!("{}/args", root_path);
     patches.push(mk_replace_patch(arg_path, new_args));
 
     if c.volume_mounts.is_none() {
-        let volume_mount_path = format!("/{}/volumeMounts", root_path);
+        let volume_mount_path = format!("{}/volumeMounts", root_path);
         patches.push(mk_root_patch(volume_mount_path));
     }
 
-    let volume_path = format!("/{}/volumeMounts/-", root_path);
+    let volume_path = format!("{}/volumeMounts/-", root_path);
     patches.push(mk_add_patch(volume_path, create_volume_mount(true)));
 
     Ok(patches)
@@ -394,15 +375,11 @@ fn create_volume_mount(read_only: bool) -> k8s_openapi::api::core::v1::VolumeMou
 
 fn create_curl_container() -> k8s_openapi::api::core::v1::Container {
     let mut args = vec!["-c".into()];
-    let await_url = String::from("https://github.com/linkerd/linkerd-await/releases/download/release%2Fv0.2.7/linkerd-await-v0.2.7-amd64");
-    let curl_command = format!(
-        "curl -sSLo {} {};chmod 755 /linkerd/linkerd-await",
-        "/linkerd/linkerd-await", await_url
-    );
-    args.push(curl_command);
+    let comm = format!("cp {} {}", "/tmp/linkerd-await", "/linkerd/linkerd-await");
+    args.push(comm);
     k8s_openapi::api::core::v1::Container {
         name: "await-init".to_owned(),
-        image: Some("ghcr.io/mateiidavid/linkerd-sweep:test".to_owned()),
+        image: Some("ghcr.io/mateiidavid/await-util:test".to_owned()),
         image_pull_policy: Some("IfNotPresent".to_owned()),
         volume_mounts: Some(vec![create_volume_mount(false)]),
         command: Some(vec!["/bin/sh".into()]),
