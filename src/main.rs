@@ -1,11 +1,9 @@
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 
 use anyhow::Result;
 use clap::Parser;
-use futures::lock::Mutex;
-use k8s_openapi::api::core::v1::Pod;
-use kube::api::ListParams;
-use tokio::sync::mpsc;
+use linkerd_sweep::server::AdmissionServer;
+use tracing::info;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -14,44 +12,37 @@ struct Args {
     #[clap(
         long,
         env = "LINKERD_SWEEP_LOG_LEVEL",
-        default_value = "linkerd_sweep=debug,kubert=info,warn"
+        default_value = "linkerd_sweep=info,warn"
     )]
     log_level: kubert::LogFilter,
 
     /// Log format (json | plain)
-    #[clap(long, default_value = "plain")]
+    #[clap(long, env = "LINKERD_SWEEP_LOG_FORMAT", default_value = "plain")]
     log_format: kubert::LogFormat,
-
-    #[clap(flatten)]
-    client: kubert::ClientArgs,
-
-    #[clap(flatten)]
-    admin: kubert::AdminArgs,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let Args {
         log_level,
         log_format,
-        client,
-        admin,
     } = Args::parse();
 
-    let mut rt = kubert::Runtime::builder()
-        .with_log(log_level, log_format)
-        .with_admin(admin)
-        .with_client(client)
-        .build()
-        .await?;
+    log_format.try_init(log_level)?;
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 443));
-    let server = linkerd_sweep::server::AdmissionServer::new(addr);
-    server.run().await;
+    let (_shutdown_tx, shutdown_rx) = kubert::shutdown::sigint_or_sigterm()?;
+
+    let listen_addr = SocketAddr::from(([0, 0, 0, 0], 443));
+    let server = AdmissionServer::new(listen_addr, shutdown_rx.clone());
+    let server_task = tokio::spawn(server.run());
+    tokio::select! {
+        _ = shutdown_rx.signaled() => {
+            info!("Received shutdown signal");
+            return Ok(());
+        }
+
+        _ = server_task => {}
+    }
+
     Ok(())
 }
-
-/* TODO:
- - get up and running with kube
- - watch pod resources... or jobs?
-*/
