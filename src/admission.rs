@@ -65,6 +65,12 @@ impl Service<Request<Body>> for Admission {
     }
 }
 
+impl Default for Admission {
+    fn default() -> Self {
+        Admission::new()
+    }
+}
+
 impl Admission {
     pub fn new() -> Self {
         Admission

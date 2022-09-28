@@ -1,4 +1,3 @@
-
 use std::{net::SocketAddr, path::PathBuf};
 
 use crate::admission::Admission;
@@ -16,7 +15,6 @@ pub struct AdmissionServer {
     cert_path: PathBuf,
     key_path: PathBuf,
 }
-
 
 impl AdmissionServer {
     pub fn new(bind_addr: SocketAddr, shutdown: shutdown::Watch) -> Self {
@@ -67,14 +65,16 @@ impl AdmissionServer {
                 }
             };
 
-            tokio::spawn(Self::handle_conn(socket, peer_addr, cert_path.clone(), key_path.clone()));
+            tokio::spawn(Self::handle_conn(
+                socket,
+                peer_addr,
+                cert_path.clone(),
+                key_path.clone(),
+            ));
         }
     }
 
-    #[tracing::instrument(
-        level = "info", 
-        skip(socket, cert_path, key_path), 
-        fields(client.addr = %client_addr))]
+    #[tracing::instrument(level = "info", skip_all, fields(client.addr = %client_addr))]
     async fn handle_conn(
         socket: TcpStream,
         client_addr: SocketAddr,
@@ -104,4 +104,3 @@ impl AdmissionServer {
         Ok(())
     }
 }
-

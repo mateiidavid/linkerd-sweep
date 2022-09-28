@@ -13,7 +13,7 @@ impl JsonPatch for PodSpec {
         let mut patches: Vec<PatchOperation> = vec![];
 
         if self.init_containers.is_none() {
-            patches.push(mk_add_patch("/spec/initContainers", {}));
+            patches.push(mk_add_patch("/spec/initContainers", ()));
         }
         patches.push(mk_add_patch(
             "/spec/initContainers/-",
@@ -21,7 +21,7 @@ impl JsonPatch for PodSpec {
         ));
 
         if self.volumes.is_none() {
-            patches.push(mk_add_patch("/spec/volumes", {}));
+            patches.push(mk_add_patch("/spec/volumes", ()));
         }
 
         patches.push(mk_add_patch(
@@ -105,11 +105,11 @@ fn mk_replace_patch<T: Serialize, S: Into<String>>(path: S, value: T) -> PatchOp
     })
 }
 
-fn mk_root_patch<S: Into<String>>(path: S) -> Result<PatchOperation, _> {
-    Ok(PatchOperation::Add(AddOperation {
+fn mk_root_patch<S: Into<String>>(path: S) -> PatchOperation {
+    PatchOperation::Add(AddOperation {
         path: path.into(),
         value: serde_json::json!({}),
-    }))
+    })
 }
 
 fn create_volume_mount(read_only: bool) -> VolumeMount {

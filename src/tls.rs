@@ -8,7 +8,7 @@ pub async fn load_certificate(path: &PathBuf) -> Result<Vec<rustls::Certificate>
     let mut reader = BufReader::new(file.as_slice());
 
     let certs = rustls_pemfile::certs(&mut reader)?;
-    if certs.len() == 0 {
+    if certs.is_empty() {
         return Err(anyhow!(
             "expected at least one certificate in file {:?}",
             &path
